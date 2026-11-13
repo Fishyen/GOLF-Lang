@@ -48,6 +48,30 @@ func Free[T any](p *T) {
 	freePages(unsafe.Pointer(p), size)
 }
 
+// AllocN allocates zeroed memory for n contiguous Ts outside the Go
+// heap in a single mapping and returns it as a slice. The memory is
+// never garbage collected; it must be released with FreeN.
+func AllocN[T any](n int) []T {
+	var zero T
+	size := int(unsafe.Sizeof(zero)) * n
+	if size == 0 {
+		size = 1
+	}
+	b := allocPages(size)
+	return unsafe.Slice((*T)(unsafe.Pointer(&b[0])), n)
+}
+
+// FreeN releases memory previously returned by AllocN[T]. s must not
+// be used after FreeN returns.
+func FreeN[T any](s []T) {
+	if len(s) == 0 {
+		return
+	}
+	var zero T
+	size := int(unsafe.Sizeof(zero)) * len(s)
+	freePages(unsafe.Pointer(&s[0]), size)
+}
+
 func pageRoundUp(size int) int {
 	pageSize := syscall.Getpagesize()
 	if size <= 0 {

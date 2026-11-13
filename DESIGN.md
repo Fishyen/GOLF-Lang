@@ -149,6 +149,36 @@ buffer) for no correctness benefit once §3.3's copy-at-boundary check
 covers pointer arguments crossing modes; it simply isn't *necessary* in a
 gc-mode file, not forbidden.
 
+**Benchmarked (2026-11-13), per-object `Alloc`/`Free` is a net loss, not a
+win:** one `mmap`/`munmap` syscall per object is extremely expensive next to
+Go's bump-allocating GC heap:
+
+| pattern (n=1000 `Vec3{X,Y,Z float64}`)         | time/op   |
+|-------------------------------------------------|-----------|
+| `golf.Alloc`+`Free` per object, immediately     | 2.29 ms   |
+| `new(Vec3)` per object, immediately (escape-analyzed away) | 138 ns |
+| `golf.Alloc` n objects, keep, then `Free` all   | 2.70 ms   |
+| `new(Vec3)` n objects, keep (real heap allocs)  | 9.68 µs   |
+| `golf.AllocN[Vec3](n)` -- **one** mmap for all n, one `FreeN` | 6.72 µs |
+
+Per-object manual allocation is ~16,000x slower than a stack-allocated GC
+value and ~245x slower than a real GC-heap allocation of the same shape --
+syscall overhead dominates completely. A single bulk allocation
+(`golf.AllocN`/`FreeN`, added alongside this benchmark) amortizes that
+overhead away and comes out *ahead* of the GC-heap case (6.7µs vs 9.7µs)
+by skipping GC bookkeeping entirely once the syscall cost is shared across
+the whole batch.
+
+**Conclusion:** `golf.Alloc`/`Free` as implemented should not be reached
+for repeated small allocations -- doing so is a regression, not an
+optimization. The actual performance lever for manual-mode code is
+amortizing the syscall over many objects, i.e. an arena/pool allocator.
+That is exactly what **RSR** (§3.1, deferred past v1) is meant to be, so
+this suggests RSR -- not per-object `Alloc`/`Free` -- is where manual
+mode's real performance win has to come from; `Alloc`/`Free` is better
+understood as a correctness-first baseline (explicit, deterministic
+lifetime) than a speed feature on its own.
+
 **Open hazard, not solved by v1:** nothing currently stops a program from
 storing a GC-managed value (a string, slice, pointer into the Go heap --
 maps/interfaces are separately disallowed per §3.4) inside memory obtained
