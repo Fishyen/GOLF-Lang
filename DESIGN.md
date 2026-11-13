@@ -57,11 +57,56 @@ linker already does well -- but closing this one specific gap: giving the
 programmer a way to tell the compiler/linker exactly which methods a
 reflection-driven caller actually needs for a given type, so the rest of
 that type's exported methods stay eligible for the dead-code elimination
-they'd otherwise lose. Exact mechanism (a directive on the type, a
-build-time manifest, something else) not yet decided -- this would also
-be a `cmd/link` deadcode-pass change, a different part of the toolchain
-than everything built so far this session (which has all been
-frontend/type-checking work), and not yet attempted.
+they'd otherwise lose.
+
+**Chosen mechanism:** `//golf:noreflect(Method, ...)` immediately before a
+type declaration -- an *exemption* list, not an allow-list: it names
+specific exported methods of that type the programmer asserts are never
+looked up dynamically (`reflect.Value.MethodByName`/`Type.MethodByName`
+with a non-constant name), so cmd/link's deadcode pass can treat them as
+ordinarily dead-code-eligible even though the type's *rtype is reachable
+and some reflect method lookup elsewhere in the binary would otherwise
+force retaining its entire method set (§2's investigation). Everything
+else about the type is unaffected; omit the directive and nothing
+changes.
+
+This spans three separate subsystems that have to stay consistent --
+frontend directive parsing, the method-table encoding `cmd/compile`'s
+`reflectdata` package emits per type, and `cmd/link`'s deadcode pass that
+reads it -- so it was built in two steps, the same "inert plumbing first"
+pattern §3's mode directive started with.
+
+**Status (step 1, done):** frontend parsing and validation only, with no
+effect on compiled output yet -- a correctness increment, not a
+performance one. `//golf:noreflect(...)` is recognized only immediately
+before a type declaration (erroring as misplaced anywhere else, including
+the package clause or a func/var decl); each named method must actually
+exist on that type and be exported (anything else errors, including a
+duplicate name in the list); a valid directive's method list is recorded
+in `pkgWriter.typeNoReflectMethods` and, with the new `-d=golfnoreflect`
+debug flag, printed per type -- but nothing downstream (codegen, the
+linker) reads that map yet, so right now the directive changes nothing
+about what gets compiled or linked.
+
+**Not yet done:** step 2 -- actually wiring the validated list through to
+`cmd/link`'s deadcode pass (`src/cmd/link/internal/ld/deadcode.go`), so a
+listed method is skipped when the pass would otherwise retain a
+reflect-touched type's whole method set. The natural implementation
+(researched, not yet built) avoids changing `cmd/internal/goobj`'s
+per-symbol flag format, which is already at capacity (`Sym.Flag`/`Flag2`
+are full 8-bit fields -- widening either would shift every subsequent
+field's byte offset for every symbol in every object file, a far
+higher-risk change than anything built so far): instead, `reflectdata`
+would emit a plain auxiliary data symbol per annotated type, named by a
+predictable convention off that type's existing `*rtype` descriptor
+symbol name, holding the exempt method names; `deadcode.go`'s retention
+loop would probe for that symbol by name (via the type symbol it already
+has, `methodref.src`) and skip any method whose name appears in it. This
+needs real verification before it can be trusted -- the stdlib test suite
+doesn't exercise this new directive at all, so a subtle bug in it (a
+method wrongly dropped) would only surface as a runtime failure in actual
+annotated reflection code, not a build break, which is a weaker safety
+net than everything else built so far this session had.
 
 ## 3. Memory management modes
 

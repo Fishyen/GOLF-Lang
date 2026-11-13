@@ -190,6 +190,13 @@ type pragmas struct {
 	// package clause (i.e. the file-level pragma).
 	GolfMem    string
 	GolfMemPos syntax.Pos
+
+	// GolfNoReflect holds the method names named by a
+	// //golf:noreflect(Name, ...) directive, or nil if none was seen.
+	// Only meaningful when attached to a type declaration; see
+	// DESIGN.md §2.
+	GolfNoReflect    []string
+	GolfNoReflectPos syntax.Pos
 }
 
 func (p *pragmas) Nointerface() bool {
@@ -238,6 +245,9 @@ func (p *noder) checkUnusedDuringParse(pragma *pragmas) {
 	}
 	if pragma.GolfMem != "" {
 		p.error(syntax.Error{Pos: pragma.GolfMemPos, Msg: "misplaced //golf:mem directive; must precede the package clause"})
+	}
+	if len(pragma.GolfNoReflect) > 0 {
+		p.error(syntax.Error{Pos: pragma.GolfNoReflectPos, Msg: "misplaced //golf:noreflect directive; must precede a type declaration"})
 	}
 }
 
@@ -345,6 +355,15 @@ func (p *noder) pragma(pos syntax.Pos, blankLine bool, text string, old syntax.P
 		pragma.GolfMem = mode
 		pragma.GolfMemPos = pos
 
+	case strings.HasPrefix(text, "golf:noreflect("):
+		names, err := parseGolfNoReflect(text)
+		if err != nil {
+			p.error(syntax.Error{Pos: pos, Msg: err.Error()})
+			break
+		}
+		pragma.GolfNoReflect = append(pragma.GolfNoReflect, names...)
+		pragma.GolfNoReflectPos = pos
+
 	case strings.HasPrefix(text, "go:cgo_import_dynamic "):
 		// This is permitted for general use because Solaris
 		// code relies on it in golang.org/x/sys/unix and others.
@@ -411,6 +430,48 @@ func parseGolfMem(text string) (string, error) {
 	default:
 		return "", fmt.Errorf("unknown //golf:mem mode %q; want gc or manual", mode)
 	}
+}
+
+// parseGolfNoReflect parses the argument of a "golf:noreflect(...)"
+// directive text (e.g. "golf:noreflect(Foo, Bar)") into the list of
+// named method identifiers. It only checks syntax here (comma-
+// separated identifiers); whether each name actually is an exported
+// method of the type the directive is attached to is checked later,
+// once types2 info is available, in declCollector (writer.go). See
+// DESIGN.md §2.
+func parseGolfNoReflect(text string) ([]string, error) {
+	rest := strings.TrimPrefix(text, "golf:noreflect(")
+	i := strings.IndexByte(rest, ')')
+	if i < 0 || i != len(rest)-1 {
+		return nil, fmt.Errorf("usage: //golf:noreflect(Method, ...)")
+	}
+	rest = rest[:i]
+	if rest == "" {
+		return nil, fmt.Errorf("usage: //golf:noreflect(Method, ...): need at least one method name")
+	}
+
+	var names []string
+	for _, part := range strings.Split(rest, ",") {
+		name := strings.TrimSpace(part)
+		if name == "" || !isGoIdent(name) {
+			return nil, fmt.Errorf("//golf:noreflect: %q is not a valid method name", name)
+		}
+		names = append(names, name)
+	}
+	return names, nil
+}
+
+// isGoIdent reports whether s is syntactically a valid Go identifier.
+func isGoIdent(s string) bool {
+	for i, r := range s {
+		switch {
+		case r == '_' || unicode.IsLetter(r):
+		case i > 0 && unicode.IsDigit(r):
+		default:
+			return false
+		}
+	}
+	return s != ""
 }
 
 // golfFileMode returns f's memory-management mode, as set by a

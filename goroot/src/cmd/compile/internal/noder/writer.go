@@ -15,6 +15,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"unicode"
 
 	"cmd/compile/internal/base"
 	"cmd/compile/internal/ir"
@@ -100,6 +101,13 @@ type pkgWriter struct {
 	// being made explicit by the wrapping call. See DESIGN.md §3.3.
 	golfReturnExempt map[*syntax.CallExpr]bool
 
+	// typeNoReflectMethods records, for a type declared with a
+	// //golf:noreflect(Name, ...) directive, the validated list of
+	// method names it names. See DESIGN.md §2 and checkGolfNoReflect.
+	// Not yet consumed by anything past diagnostics (-d=golfnoreflect);
+	// backend/linker enforcement is a separate, later step.
+	typeNoReflectMethods map[*types2.TypeName][]string
+
 	// linknames maps package-scope objects to their linker symbol name,
 	// if specified by a //go:linkname or //go:linknamestd directive.
 	linknames map[types2.Object]struct {
@@ -133,8 +141,9 @@ func newPkgWriter(m posMap, pkg *types2.Package, info *types2.Info, otherInfo ma
 		typDecls:  make(map[*types2.TypeName]typeDeclGen),
 		methodIdx: make(map[*types2.Func]int),
 
-		funcGolfMode:     make(map[*types2.Func]string),
-		golfReturnExempt: make(map[*syntax.CallExpr]bool),
+		funcGolfMode:         make(map[*types2.Func]string),
+		golfReturnExempt:     make(map[*syntax.CallExpr]bool),
+		typeNoReflectMethods: make(map[*types2.TypeName][]string),
 
 		linknames: make(map[types2.Object]struct {
 			remote string
@@ -2899,9 +2908,10 @@ func (c *declCollector) Visit(n syntax.Node) syntax.Visitor {
 		d := typeDeclGen{TypeDecl: n, implicits: c.implicits}
 
 		if n.Alias {
-			pw.checkPragmas(n.Pragma, 0, false)
+			pw.checkPragmasTypeDecl(n.Pragma, 0, false)
 		} else {
-			pw.checkPragmas(n.Pragma, 0, false)
+			pw.checkPragmasTypeDecl(n.Pragma, 0, false)
+			checkGolfNoReflect(pw, obj, n.Pragma)
 
 			// Assign a unique ID to function-scoped defined types.
 			if c.withinFunc {
@@ -2982,6 +2992,55 @@ func (c *declCollector) Visit(n syntax.Node) syntax.Visitor {
 	}
 
 	return c
+}
+
+// checkGolfNoReflect validates a //golf:noreflect(Name, ...) directive
+// attached to the type declaration that defines obj, if any: each
+// named method must actually exist on the type and be exported (the
+// only kind reflect.Value.MethodByName can look up in the first
+// place). Valid directives are recorded in pw.typeNoReflectMethods
+// and, with -d=golfnoreflect, printed as a diagnostic. See DESIGN.md
+// §2 -- this is deliberately inert plumbing for now: nothing past
+// this diagnostic consumes the recorded list yet. Enforcing it (by
+// making cmd/link's deadcode pass skip these methods when it would
+// otherwise retain a type's whole method set for reflection) is a
+// separate, later step.
+func checkGolfNoReflect(pw *pkgWriter, obj *types2.TypeName, p syntax.Pragma) {
+	if p == nil {
+		return
+	}
+	pragma := p.(*pragmas)
+	names := pragma.GolfNoReflect
+	if len(names) == 0 {
+		return
+	}
+
+	seen := make(map[string]bool, len(names))
+	for _, name := range names {
+		if seen[name] {
+			pw.errorf(pragma.GolfNoReflectPos, "//golf:noreflect: duplicate method name %q", name)
+			continue
+		}
+		seen[name] = true
+
+		if !unicode.IsUpper([]rune(name)[0]) {
+			pw.errorf(pragma.GolfNoReflectPos, "//golf:noreflect: %q is not exported; reflect.Value.MethodByName can only ever find exported methods", name)
+			continue
+		}
+
+		found, _, _ := types2.LookupFieldOrMethod(obj.Type(), true, obj.Pkg(), name)
+		m, ok := found.(*types2.Func)
+		if !ok || m.Type().(*types2.Signature).Recv() == nil {
+			pw.errorf(pragma.GolfNoReflectPos, "//golf:noreflect: %s has no method %q", obj.Name(), name)
+			continue
+		}
+	}
+
+	if base.Debug.Golfnoreflect != 0 {
+		fmt.Fprintf(os.Stderr, "golfnoreflect: %s.%s: %v\n", obj.Pkg().Path(), obj.Name(), names)
+	}
+
+	pw.typeNoReflectMethods[obj] = names
 }
 
 // calleeGolfMode returns the //golf:mem mode of the file callee was
@@ -3277,8 +3336,24 @@ func (pw *pkgWriter) checkPragmas(p syntax.Pragma, allowed ir.PragmaFlag, embedO
 
 // checkPragmasGolfMem is checkPragmas, plus a fileLevel flag: a
 // //golf:mem directive is only valid when attached to the package
-// clause (the file-level pragma); anywhere else it is misplaced.
+// clause (the file-level pragma); anywhere else it is misplaced. It
+// also rejects //golf:noreflect here, since that one is only valid on
+// a type declaration -- callers on a type declaration use
+// checkPragmasTypeDecl instead, which skips this rejection.
 func (pw *pkgWriter) checkPragmasGolfMem(p syntax.Pragma, allowed ir.PragmaFlag, embedOK bool, fileLevel bool) {
+	pw.checkPragmasGolf(p, allowed, embedOK, fileLevel, false)
+}
+
+// checkPragmasTypeDecl is checkPragmas for a type declaration: like
+// checkPragmasGolfMem with fileLevel false, except it allows (and
+// doesn't itself validate) a //golf:noreflect directive, which the
+// *syntax.TypeDecl case in declCollector.Visit validates separately
+// once types2 info for the declared type is available.
+func (pw *pkgWriter) checkPragmasTypeDecl(p syntax.Pragma, allowed ir.PragmaFlag, embedOK bool) {
+	pw.checkPragmasGolf(p, allowed, embedOK, false, true)
+}
+
+func (pw *pkgWriter) checkPragmasGolf(p syntax.Pragma, allowed ir.PragmaFlag, embedOK bool, fileLevel, typeDecl bool) {
 	if p == nil {
 		return
 	}
@@ -3298,6 +3373,9 @@ func (pw *pkgWriter) checkPragmasGolfMem(p syntax.Pragma, allowed ir.PragmaFlag,
 
 	if pragma.GolfMem != "" && !fileLevel {
 		pw.errorf(pragma.GolfMemPos, "misplaced //golf:mem directive; must precede the package clause")
+	}
+	if len(pragma.GolfNoReflect) > 0 && !typeDecl {
+		pw.errorf(pragma.GolfNoReflectPos, "misplaced //golf:noreflect directive; must precede a type declaration")
 	}
 }
 
