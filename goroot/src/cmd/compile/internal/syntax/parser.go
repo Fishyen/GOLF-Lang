@@ -460,6 +460,20 @@ func (p *parser) fileOrNil() *File {
 			}
 
 		default:
+			if p.tok == _Name {
+				if mode, pos, name := p.golfVarModOrNil(); mode != "" {
+					f.DeclList = p.appendGroup(f.DeclList, func(group *Group) Decl {
+						return p.varDeclMode(group, mode, pos)
+					})
+					break
+				} else if name != nil {
+					// Not a //golf per-declaration modifier after all;
+					// fall through to the ordinary diagnostic below. The
+					// identifier itself is already consumed, which is
+					// fine here since this path only ever reports an
+					// error and resynchronizes.
+				}
+			}
 			if p.tok == _Lbrace && len(f.DeclList) > 0 && isEmptyFuncDecl(f.DeclList[len(f.DeclList)-1]) {
 				// opening { of function declaration on next line
 				p.syntaxError("unexpected semicolon or newline before {")
@@ -769,14 +783,25 @@ func isTypeElem(x Expr) bool {
 
 // VarSpec = IdentifierList ( Type [ "=" ExpressionList ] | "=" ExpressionList ) .
 func (p *parser) varDecl(group *Group) Decl {
+	return p.varDeclMode(group, "", p.pos())
+}
+
+// varDeclMode is varDecl, but for a declaration whose "var" keyword was
+// preceded by a //golf per-declaration mode modifier ("collect",
+// "manual", or "real"); mode is the modifier ("gc", "manual", or
+// "real"), or "" for an ordinary declaration. pos is the declaration's
+// reported position: the modifier's own position when mode != "", else
+// the usual position immediately after "var". See DESIGN.md §3.2.
+func (p *parser) varDeclMode(group *Group, mode string, pos Pos) Decl {
 	if trace {
 		defer p.trace("varDecl")()
 	}
 
 	d := new(VarDecl)
-	d.pos = p.pos()
+	d.pos = pos
 	d.Group = group
 	d.Pragma = p.takePragma()
+	d.GolfMode = mode
 
 	d.NameList = p.nameList(p.name())
 	if p.gotAssign() {
@@ -789,6 +814,74 @@ func (p *parser) varDecl(group *Group) Decl {
 	}
 
 	return d
+}
+
+// golfVarModKeyword reports whether lit is one of the contextual
+// keywords recognized immediately before "var" to opt a single
+// declaration out of its file's default //golf:mem mode: "collect"
+// (gc), "manual", or "real" (reserved for RSR). These are soft
+// keywords, not reserved words -- everywhere else they remain ordinary
+// identifiers, so existing Go source using them as names is unaffected.
+// See DESIGN.md §3.2.
+func golfVarModKeyword(lit string) (mode string, ok bool) {
+	switch lit {
+	case "collect":
+		return "gc", true
+	case "manual":
+		return "manual", true
+	case "real":
+		return "real", true
+	}
+	return "", false
+}
+
+// golfVarModOrNil checks whether the parser is positioned at a
+// golfVarModKeyword immediately followed by "var" -- the only context
+// these words are ever special in, since a bare identifier followed by
+// a newline (hence an automatically inserted semicolon) could never
+// reach "var" directly, making this two-token sequence unambiguous.
+//
+// If it matches, both tokens are consumed and mode/pos describe the
+// modifier (mode != ""). If the current token isn't one of these
+// keywords at all, mode == "" and name == nil, and nothing is
+// consumed. If it's one of these words but not followed by "var", the
+// identifier has already been consumed (there is no token pushback in
+// this scanner) and is returned as name, a *Name the caller must feed
+// back into ordinary expression parsing in its place.
+func (p *parser) golfVarModOrNil() (mode string, pos Pos, name *Name) {
+	pos = p.pos()
+	mode, ok := golfVarModKeyword(p.lit)
+	if !ok {
+		return "", pos, nil
+	}
+	lit := p.lit
+	p.next()
+	if p.tok == _Var {
+		p.next()
+		return mode, pos, nil
+	}
+	return "", pos, NewName(pos, lit)
+}
+
+// exprListFrom is exprList, but for when the first operand x has
+// already been parsed as a primary expression (including any
+// trailers, via pexpr) -- it only still needs binary-operator and
+// comma-list handling. Used to resume ordinary expression parsing
+// after golfVarModOrNil determined its candidate identifier was not,
+// after all, a //golf per-declaration mode modifier.
+func (p *parser) exprListFrom(x Expr) Expr {
+	x = p.binaryExpr(x, 0)
+	if p.got(_Comma) {
+		list := []Expr{x, p.expr()}
+		for p.got(_Comma) {
+			list = append(list, p.expr())
+		}
+		t := new(ListExpr)
+		t.pos = x.Pos()
+		t.ElemList = list
+		x = t
+	}
+	return x
 }
 
 // FunctionDecl = "func" FunctionName [ TypeParams ] ( Function | Signature ) .
@@ -2606,6 +2699,20 @@ func (p *parser) stmtOrNil() Stmt {
 	// look for it first before doing anything more expensive.
 	if p.tok == _Name {
 		p.clearPragma()
+		if mode, pos, name := p.golfVarModOrNil(); mode != "" {
+			s := new(DeclStmt)
+			s.pos = pos
+			s.DeclList = p.appendGroup(nil, func(group *Group) Decl {
+				return p.varDeclMode(group, mode, pos)
+			})
+			return s
+		} else if name != nil {
+			x := p.exprListFrom(p.pexpr(name, false))
+			if label, ok := x.(*Name); ok && p.tok == _Colon {
+				return p.labeledStmtOrNil(label)
+			}
+			return p.simpleStmt(x, 0)
+		}
 		lhs := p.exprList()
 		if label, ok := lhs.(*Name); ok && p.tok == _Colon {
 			return p.labeledStmtOrNil(label)

@@ -197,14 +197,6 @@ type pragmas struct {
 	// DESIGN.md §2.
 	GolfNoReflect    []string
 	GolfNoReflectPos syntax.Pos
-
-	// GolfVarMode holds the mode named by a per-declaration
-	// //golf:collect, //golf:manual, or //golf:real directive
-	// ("gc", "manual", or "real" respectively), or "" if none was
-	// seen. Only meaningful when attached to a var declaration; see
-	// DESIGN.md §3.2.
-	GolfVarMode    string
-	GolfVarModePos syntax.Pos
 }
 
 func (p *pragmas) Nointerface() bool {
@@ -256,9 +248,6 @@ func (p *noder) checkUnusedDuringParse(pragma *pragmas) {
 	}
 	if len(pragma.GolfNoReflect) > 0 {
 		p.error(syntax.Error{Pos: pragma.GolfNoReflectPos, Msg: "misplaced //golf:noreflect directive; must precede a type declaration"})
-	}
-	if pragma.GolfVarMode != "" {
-		p.error(syntax.Error{Pos: pragma.GolfVarModePos, Msg: "misplaced //golf:collect, //golf:manual, or //golf:real directive; must precede a var declaration"})
 	}
 }
 
@@ -374,15 +363,6 @@ func (p *noder) pragma(pos syntax.Pos, blankLine bool, text string, old syntax.P
 		}
 		pragma.GolfNoReflect = append(pragma.GolfNoReflect, names...)
 		pragma.GolfNoReflectPos = pos
-
-	case text == "golf:collect", text == "golf:manual", text == "golf:real":
-		mode := map[string]string{"golf:collect": "gc", "golf:manual": "manual", "golf:real": "real"}[text]
-		if pragma.GolfVarMode != "" && pragma.GolfVarMode != mode {
-			p.error(syntax.Error{Pos: pos, Msg: "conflicting per-declaration golf memory-mode directives"})
-			break
-		}
-		pragma.GolfVarMode = mode
-		pragma.GolfVarModePos = pos
 
 	case strings.HasPrefix(text, "go:cgo_import_dynamic "):
 		// This is permitted for general use because Solaris

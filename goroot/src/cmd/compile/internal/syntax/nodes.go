@@ -101,6 +101,13 @@ type (
 		NameList []*Name
 		Type     Expr // nil means no type
 		Values   Expr // nil means no values
+
+		// GolfMode is "gc", "manual", or "real" when this declaration
+		// was preceded by the contextual keyword "collect", "manual",
+		// or "real" respectively (opting it out of the file's default
+		// //golf:mem mode), or "" for an ordinary declaration. See
+		// DESIGN.md §3.2.
+		GolfMode string
 		decl
 	}
 

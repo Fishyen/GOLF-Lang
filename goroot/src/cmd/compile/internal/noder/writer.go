@@ -108,6 +108,14 @@ type pkgWriter struct {
 	// backend/linker enforcement is a separate, later step.
 	typeNoReflectMethods map[*types2.TypeName][]string
 
+	// varGolfMode records, for a package-level or local var object
+	// declared with a 'collect'/'manual' modifier, its overridden
+	// //golf:mem mode ("gc" or "manual"). Consulted by every later
+	// direct assignment to that same variable anywhere in the file, so
+	// the opt-out follows the variable (dataflow), not just its
+	// declaration statement. See DESIGN.md §3.2.
+	varGolfMode map[*types2.Var]string
+
 	// linknames maps package-scope objects to their linker symbol name,
 	// if specified by a //go:linkname or //go:linknamestd directive.
 	linknames map[types2.Object]struct {
@@ -144,6 +152,7 @@ func newPkgWriter(m posMap, pkg *types2.Package, info *types2.Info, otherInfo ma
 		funcGolfMode:         make(map[*types2.Func]string),
 		golfReturnExempt:     make(map[*syntax.CallExpr]bool),
 		typeNoReflectMethods: make(map[*types2.TypeName][]string),
+		varGolfMode:          make(map[*types2.Var]string),
 
 		linknames: make(map[types2.Object]struct {
 			remote string
@@ -2886,6 +2895,31 @@ func (c *declCollector) golfMode() string {
 	return c.file.golfMode
 }
 
+// assignLhsGolfMode reports the //golf:collect/manual override mode
+// in effect for an assignment's left-hand side, if any target
+// (resolved by object identity, so a shadowing local of the same name
+// never matches a package-level override) names a variable recorded
+// in pw.varGolfMode. This is what makes the opt-out follow the
+// variable through later assignments (dataflow), not just its
+// original declaration statement -- see DESIGN.md §3.2.
+func (c *declCollector) assignLhsGolfMode(lhs syntax.Expr) (string, bool) {
+	switch lhs := lhs.(type) {
+	case *syntax.Name:
+		if obj, ok := c.pw.info.Uses[lhs].(*types2.Var); ok {
+			if mode, ok := c.pw.varGolfMode[obj]; ok {
+				return mode, true
+			}
+		}
+	case *syntax.ListExpr:
+		for _, e := range lhs.ElemList {
+			if mode, ok := c.assignLhsGolfMode(e); ok {
+				return mode, true
+			}
+		}
+	}
+	return "", false
+}
+
 func (c *declCollector) withTParams(obj types2.Object) *declCollector {
 	tparams := slices.Concat(objRecvTypeParams(obj), objTypeParams(obj))
 	if len(tparams) == 0 {
@@ -2954,7 +2988,7 @@ func (c *declCollector) Visit(n syntax.Node) syntax.Visitor {
 		return c.withTParams(obj)
 
 	case *syntax.VarDecl:
-		pw.checkPragmasVarDecl(n.Pragma, 0, true)
+		pw.checkPragmas(n.Pragma, 0, true)
 
 		if p, ok := n.Pragma.(*pragmas); ok && len(p.Embeds) > 0 {
 			if err := checkEmbed(n, c.file.importedEmbed, c.withinFunc); err != nil {
@@ -2962,16 +2996,33 @@ func (c *declCollector) Visit(n syntax.Node) syntax.Visitor {
 			}
 		}
 
-		if p, ok := n.Pragma.(*pragmas); ok && p.GolfVarMode != "" {
-			if p.GolfVarMode == "real" {
-				pw.errorf(p.GolfVarModePos, "//golf:real is reserved for RSR, not implemented yet; see DESIGN.md §3.1")
-			} else if p.GolfVarMode == c.golfMode() {
-				pw.errorf(p.GolfVarModePos, "redundant //golf:%s directive; this declaration is already in %s mode", map[string]string{"gc": "collect", "manual": "manual"}[p.GolfVarMode], p.GolfVarMode)
+		if n.GolfMode != "" {
+			if n.GolfMode == "real" {
+				pw.errorf(n, "'real' is reserved for RSR, not implemented yet; see DESIGN.md §3.1")
+			} else if n.GolfMode == c.golfMode() {
+				pw.errorf(n, "redundant '%s' modifier; this declaration is already in %s mode", map[string]string{"gc": "collect", "manual": "manual"}[n.GolfMode], n.GolfMode)
 			} else {
+				// Record it for every variable this declares, so any
+				// later direct assignment to the same variable (by
+				// identity, not name) anywhere in the file follows the
+				// same override -- see the *syntax.AssignStmt case and
+				// assignLhsGolfMode below.
+				for _, name := range n.NameList {
+					if obj, ok := pw.info.Defs[name].(*types2.Var); ok {
+						pw.varGolfMode[obj] = n.GolfMode
+					}
+				}
 				copy := *c
-				copy.varGolfMode = p.GolfVarMode
+				copy.varGolfMode = n.GolfMode
 				return &copy
 			}
+		}
+
+	case *syntax.AssignStmt:
+		if mode, ok := c.assignLhsGolfMode(n.Lhs); ok && mode != c.golfMode() {
+			copy := *c
+			copy.varGolfMode = mode
+			return &copy
 		}
 
 	case *syntax.BlockStmt:
@@ -3107,6 +3158,31 @@ func (pw *pkgWriter) collectFuncGolfModes(noders []*noder) {
 			}
 			if obj, ok := pw.info.Defs[fd.Name].(*types2.Func); ok {
 				pw.funcGolfMode[obj] = p.golfMode
+			}
+		}
+	}
+}
+
+// collectVarGolfModes populates pw.varGolfMode for every package-level
+// var declared with a 'collect' or 'manual' modifier, across all of
+// the package's files, independent of declaration order -- so a
+// function defined earlier in a file can still see a mode override on
+// a package-level var declared later in it. Local (function-scoped)
+// overrides don't need this: a local variable's declaration always
+// precedes its own later uses lexically, so declCollector.Visit's
+// ordinary walk populates those as it reaches each one. See
+// DESIGN.md §3.2.
+func (pw *pkgWriter) collectVarGolfModes(noders []*noder) {
+	for _, p := range noders {
+		for _, decl := range p.file.DeclList {
+			vd, ok := decl.(*syntax.VarDecl)
+			if !ok || vd.GolfMode == "" || vd.GolfMode == "real" {
+				continue
+			}
+			for _, name := range vd.NameList {
+				if obj, ok := pw.info.Defs[name].(*types2.Var); ok {
+					pw.varGolfMode[obj] = vd.GolfMode
+				}
 			}
 		}
 	}
@@ -3320,6 +3396,7 @@ func (pw *pkgWriter) collectDecls(noders []*noder) {
 	// whether its declaring file comes before or after the caller's
 	// in noders; collectFuncGolfModes removes that ordering dependency.
 	pw.collectFuncGolfModes(noders)
+	pw.collectVarGolfModes(noders)
 
 	var typegen int
 	for _, p := range noders {
@@ -3374,12 +3451,11 @@ func (pw *pkgWriter) checkPragmas(p syntax.Pragma, allowed ir.PragmaFlag, embedO
 // checkPragmasGolfMem is checkPragmas, plus a fileLevel flag: a
 // //golf:mem directive is only valid when attached to the package
 // clause (the file-level pragma); anywhere else it is misplaced. It
-// also rejects //golf:noreflect and //golf:collect/manual/real here,
-// since those are only valid on a type declaration or var declaration
-// respectively -- callers on those use checkPragmasTypeDecl or
-// checkPragmasVarDecl instead, which skip the relevant rejection.
+// also rejects //golf:noreflect here, since that one is only valid on
+// a type declaration -- callers on a type declaration use
+// checkPragmasTypeDecl instead, which skips this rejection.
 func (pw *pkgWriter) checkPragmasGolfMem(p syntax.Pragma, allowed ir.PragmaFlag, embedOK bool, fileLevel bool) {
-	pw.checkPragmasGolf(p, allowed, embedOK, fileLevel, false, false)
+	pw.checkPragmasGolf(p, allowed, embedOK, fileLevel, false)
 }
 
 // checkPragmasTypeDecl is checkPragmas for a type declaration: like
@@ -3388,19 +3464,10 @@ func (pw *pkgWriter) checkPragmasGolfMem(p syntax.Pragma, allowed ir.PragmaFlag,
 // *syntax.TypeDecl case in declCollector.Visit validates separately
 // once types2 info for the declared type is available.
 func (pw *pkgWriter) checkPragmasTypeDecl(p syntax.Pragma, allowed ir.PragmaFlag, embedOK bool) {
-	pw.checkPragmasGolf(p, allowed, embedOK, false, true, false)
+	pw.checkPragmasGolf(p, allowed, embedOK, false, true)
 }
 
-// checkPragmasVarDecl is checkPragmas for a var declaration: like
-// checkPragmasGolfMem with fileLevel false, except it allows (and
-// doesn't itself validate) a //golf:collect, //golf:manual, or
-// //golf:real directive, which the *syntax.VarDecl case in
-// declCollector.Visit validates separately. See DESIGN.md §3.2.
-func (pw *pkgWriter) checkPragmasVarDecl(p syntax.Pragma, allowed ir.PragmaFlag, embedOK bool) {
-	pw.checkPragmasGolf(p, allowed, embedOK, false, false, true)
-}
-
-func (pw *pkgWriter) checkPragmasGolf(p syntax.Pragma, allowed ir.PragmaFlag, embedOK bool, fileLevel, typeDecl, varDecl bool) {
+func (pw *pkgWriter) checkPragmasGolf(p syntax.Pragma, allowed ir.PragmaFlag, embedOK bool, fileLevel, typeDecl bool) {
 	if p == nil {
 		return
 	}
@@ -3423,9 +3490,6 @@ func (pw *pkgWriter) checkPragmasGolf(p syntax.Pragma, allowed ir.PragmaFlag, em
 	}
 	if len(pragma.GolfNoReflect) > 0 && !typeDecl {
 		pw.errorf(pragma.GolfNoReflectPos, "misplaced //golf:noreflect directive; must precede a type declaration")
-	}
-	if pragma.GolfVarMode != "" && !varDecl {
-		pw.errorf(pragma.GolfVarModePos, "misplaced //golf:collect, //golf:manual, or //golf:real directive; must precede a var declaration")
 	}
 }
 
