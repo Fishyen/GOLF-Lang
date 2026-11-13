@@ -71,6 +71,9 @@ func LoadPackage(filenames []string) {
 		}
 		lines += p.file.EOF.Line()
 		p.golfMode = golfFileMode(p.file)
+		if base.Debug.Golfmode != 0 {
+			fmt.Fprintf(os.Stderr, "golfmode: %s: %s\n", trimFilename(p.file.Pos().Base()), p.golfMode)
+		}
 	}
 	base.Timer.AddEvent(int64(lines), "lines")
 

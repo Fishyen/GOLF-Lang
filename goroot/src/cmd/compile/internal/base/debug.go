@@ -45,6 +45,7 @@ type DebugFlags struct {
 	GCCheck               int    `help:"check heap/gc use by compiler" concurrent:"ok"`
 	GCProg                int    `help:"print dump of GC programs"`
 	GCStart               int    `help:"specify \"starting\" compiler's heap size in MiB" concurrent:"ok"`
+	Golfmode              int    `help:"print each file's resolved //golf:mem mode (gc or manual)" concurrent:"ok"`
 	Gossahash             string `help:"hash value for use in debugging the compiler"`
 	Html                  string `help:"dump named function to ssa.html" concurrent:"ok"`
 	InlFuncsWithClosures  int    `help:"allow functions with closures to be inlined" concurrent:"ok"`
