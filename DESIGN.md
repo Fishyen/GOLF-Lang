@@ -172,12 +172,41 @@ the whole batch.
 **Conclusion:** `golf.Alloc`/`Free` as implemented should not be reached
 for repeated small allocations -- doing so is a regression, not an
 optimization. The actual performance lever for manual-mode code is
-amortizing the syscall over many objects, i.e. an arena/pool allocator.
-That is exactly what **RSR** (§3.1, deferred past v1) is meant to be, so
-this suggests RSR -- not per-object `Alloc`/`Free` -- is where manual
-mode's real performance win has to come from; `Alloc`/`Free` is better
-understood as a correctness-first baseline (explicit, deterministic
-lifetime) than a speed feature on its own.
+amortizing the syscall over many objects.
+
+### 3.6 Bulk allocation (`golf.AllocN`/`FreeN`, `golf.Arena`)
+
+Following directly from §3.5's benchmark, `golf` provides two ways to
+amortize allocation cost instead of paying a syscall per object:
+
+- **`AllocN[T](n) []T` / `FreeN[T](s)`** -- one mmap/munmap for n
+  contiguous `T`s, for the simple case of "I know I need n of these up
+  front, and I'll free them all together."
+- **`Arena`** (`NewArena`, `ArenaAlloc[T]`, `ArenaAllocN[T]`, `Reset`,
+  `Free`) -- a bump allocator: it maps chunks as needed and hands out
+  sub-allocations with no syscall per allocation, growing by mapping a
+  new chunk (never moving existing memory, so previously returned
+  pointers stay valid) rather than per-object `mmap`. `Reset` makes all
+  mapped chunks available again with **no new syscalls** -- the intended
+  pattern for something like a per-frame scratch allocator: allocate
+  through the frame, `Reset` at the end, reuse next frame.
+
+**Benchmarked (2026-11-13):** a per-frame pattern (allocate 1000 `Vec3`s
+from a shared `Arena`, use them, `Reset`) runs in **538 ns/op, 0
+allocs/op**, once warm -- about **19.5x faster** than the equivalent
+`new(Vec3)`-per-object GC pattern (10.5 µs/op, 1000 allocs/op). This is
+the actual performance win manual mode has been looking for: not
+`Alloc`/`Free` per object, and not needed from RSR either -- `Arena`
+already delivers it today, by turning "many small allocations with a
+shared lifetime" into "one allocation, reused."
+
+**Note:** `Arena` is *not* RSR. It has no scoped lifetimes, can't free a
+single allocation out from the middle, and the whole arena goes away (or
+resets) at once -- it's a general bulk-allocation tool, built ahead of
+RSR because RSR's actual scope-lifetime design is more involved and will
+be designed separately, later (§3.1). RSR is expected to build on the
+same amortized-allocation idea, with real per-scope lifetime tracking on
+top of something like this.
 
 **Open hazard, not solved by v1:** nothing currently stops a program from
 storing a GC-managed value (a string, slice, pointer into the Go heap --
