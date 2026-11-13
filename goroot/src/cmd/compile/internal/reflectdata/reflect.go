@@ -320,6 +320,7 @@ func dextratype(lsym *obj.LSym, off int64, t *types.Type, dataAdd int) {
 	if t.Sym() == nil && len(m) == 0 {
 		base.Fatalf("extra requested of type with no extra info %v", t)
 	}
+	writeGolfNoReflectMethods(t)
 	noff := types.RoundUp(off, int64(types.PtrSize))
 	if noff != off {
 		base.Fatalf("unexpected alignment in dextratype for %v", t)
@@ -1343,6 +1344,64 @@ func fillptrmask(t *types.Type, ptrmask []byte) {
 			ptrmask[i/8] |= 1 << (uint(i) % 8)
 		}
 	}
+}
+
+// golfNoReflectSymPrefix names the auxiliary rodata symbol
+// writeGolfNoReflectMethods emits for a type with a
+// //golf:noreflect(...) directive. cmd/link's deadcode pass looks
+// this symbol up by name (computed the same way, from the type
+// symbol it already has) rather than following a relocation, since
+// it needs no relocation TO the type descriptor -- it exists only to
+// be found, never walked into. See DESIGN.md §2.
+const golfNoReflectSymPrefix = ".golfnoreflect"
+
+// writeGolfNoReflectMethods emits t's //golf:noreflect method-name
+// list as a small rodata symbol, if t has one, so cmd/link's deadcode
+// pass can read it back and skip retaining those specific methods
+// when it would otherwise keep t's entire method set for reflection
+// (DESIGN.md §2). The encoding is minimal: each name as a one-byte
+// length (method identifiers are always short) followed by its
+// bytes, back to back, for as many names as the symbol holds -- no
+// count prefix needed, since the reader just consumes until it runs
+// out of data.
+//
+// A no-op for the overwhelming majority of types, which have no such
+// directive.
+func writeGolfNoReflectMethods(t *types.Type) {
+	// *T's method set promotes T's methods (value-receiver methods are
+	// callable through either), and gets its own, separate uncommonType
+	// method table with its own R_METHODOFF relocations -- so it needs
+	// the same exempt list under the same symbol name as T itself, not
+	// a second, differently-named copy. Resolve to the base type so a
+	// dextratype call for either variant reaches the same aux symbol.
+	recvType := t
+	if recvType.IsPtr() {
+		recvType = recvType.Elem()
+	}
+
+	names := recvType.GolfNoReflectMethods()
+	if len(names) == 0 {
+		return
+	}
+
+	lsym := TypeLinksymPrefix(golfNoReflectSymPrefix, recvType)
+	if lsym.OnList() {
+		return // already written (t can be processed more than once)
+	}
+
+	var data []byte
+	for _, name := range names {
+		if len(name) > 255 {
+			// Unreachable: identifiers this long don't happen in
+			// practice, and checkGolfNoReflect validates these are
+			// real method names before we ever get here.
+			base.Fatalf("golf:noreflect method name too long: %s", name)
+		}
+		data = append(data, byte(len(name)))
+		data = append(data, name...)
+	}
+	lsym.P = data
+	objw.Global(lsym, int32(len(data)), obj.DUPOK|obj.RODATA)
 }
 
 // dgcptrmaskOnDemand emits and returns the symbol that should be referenced by

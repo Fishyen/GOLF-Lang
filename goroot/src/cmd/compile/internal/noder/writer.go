@@ -977,6 +977,13 @@ func (w *writer) doObj(wext *writer, obj types2.Object) pkgbits.CodeObj {
 		for _, m := range methods {
 			w.method(wext, m)
 		}
+
+		// golf: this type's validated //golf:noreflect method list, if
+		// any (DESIGN.md §2). Placed here, before the generic-methods
+		// block below, so reader.go -- which doesn't decode generic
+		// methods inline -- stays in lockstep with this write.
+		w.Strings(w.p.typeNoReflectMethods[obj])
+
 		if len(gmethods) > 0 {
 			assert(w.Version().Has(pkgbits.GenericMethods))
 		}

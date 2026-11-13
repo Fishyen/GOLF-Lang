@@ -88,25 +88,74 @@ debug flag, printed per type -- but nothing downstream (codegen, the
 linker) reads that map yet, so right now the directive changes nothing
 about what gets compiled or linked.
 
-**Not yet done:** step 2 -- actually wiring the validated list through to
-`cmd/link`'s deadcode pass (`src/cmd/link/internal/ld/deadcode.go`), so a
-listed method is skipped when the pass would otherwise retain a
-reflect-touched type's whole method set. The natural implementation
-(researched, not yet built) avoids changing `cmd/internal/goobj`'s
-per-symbol flag format, which is already at capacity (`Sym.Flag`/`Flag2`
-are full 8-bit fields -- widening either would shift every subsequent
-field's byte offset for every symbol in every object file, a far
-higher-risk change than anything built so far): instead, `reflectdata`
-would emit a plain auxiliary data symbol per annotated type, named by a
-predictable convention off that type's existing `*rtype` descriptor
-symbol name, holding the exempt method names; `deadcode.go`'s retention
-loop would probe for that symbol by name (via the type symbol it already
-has, `methodref.src`) and skip any method whose name appears in it. This
-needs real verification before it can be trusted -- the stdlib test suite
-doesn't exercise this new directive at all, so a subtle bug in it (a
-method wrongly dropped) would only surface as a runtime failure in actual
-annotated reflection code, not a build break, which is a weaker safety
-net than everything else built so far this session had.
+**Status (step 2, done): enforced.** `//golf:noreflect` now actually
+closes the gap end-to-end -- a named method of an annotated type is
+dropped from the binary exactly as if reflection never touched that type,
+even when some other dynamic `MethodByName` call elsewhere forces
+retention of everything else.
+
+Implementation, exactly as sketched above (avoiding `cmd/internal/goobj`'s
+full `Sym.Flag`/`Flag2` bytes entirely):
+
+- `types.Type` gained `GolfNoReflectMethods()`/`SetGolfNoReflectMethods()`,
+  backed by a package-level `map[*Type][]string]` rather than a field on
+  `Type` itself -- `Type` is allocated for every type the compiler ever
+  touches, so a directive only a handful of types will ever use doesn't
+  belong on the hot struct (a first attempt that added the field directly
+  grew `unsafe.Sizeof(types.Type)` from 96 to 120 bytes and tripped
+  `cmd/compile/internal/types`' own `TestSizeof`).
+- The validated list travels from noder's `pkgWriter.typeNoReflectMethods`
+  (keyed by `*types2.TypeName`) to that map (keyed by the eventual
+  `*types.Type`) through the same per-object pkgbits record used for the
+  cross-package mode lookup in §3.3 -- `w.Strings(...)` in `doObj`'s
+  `*types2.TypeName` case, decoded back in `reader.go`'s `ObjType` case
+  (used for both local and cross-package type construction) with
+  `typ.SetGolfNoReflectMethods(names)`.
+- `reflectdata.writeGolfNoReflectMethods`, called from `dextratype`
+  (where a type's method table is written), emits the list as a plain
+  rodata symbol named `"type:.golfnoreflect." + t.LinkString()` -- a
+  DUPOK symbol found *by name*, not by relocation, since `cmd/link`'s
+  deadcode pass needs no reachability graph edge to it, only to look it
+  up given a type symbol it already has.
+- `cmd/link/internal/ld/deadcode.go`'s retention loop now checks
+  `!d.golfExempt(m)` before applying the `reflectSeen` fallback for a
+  candidate method `m`; `golfExempt` computes the same name from `m.src`
+  (`methodref`'s receiver type symbol) and looks up the aux symbol via
+  `Loader.Lookup`, caching the decode per type symbol. This only affects
+  the `reflectSeen` fallback branch -- a method still reachable through
+  an actually-matched interface (`d.ifaceMethod`) or generic interface
+  call (`d.genericIfaceMethod`) is retained regardless, since the
+  directive asserts "never reached via reflection," not "never reachable
+  at all."
+- `*T`'s own type descriptor gets a *separate* `methodref`/probe from
+  `T`'s (confirmed by instrumenting `golfExempt` directly during a real
+  build and inspecting its output), since pointer-receiver method tables
+  are emitted independently -- both `reflectdata.writeGolfNoReflectMethods`
+  and `deadcode.go`'s `golfNoReflectSymName` resolve to `T`'s own
+  (non-pointer) symbol name on either side, so one emitted aux symbol
+  covers both.
+- `testimporter/ureader.go`'s own, unrelated `ObjType` reading (for
+  types2-level cross-package type-checking, not used by any of the above)
+  needed a matching `_ = r.Strings()` added at the exact point the new
+  write falls in the shared record, to stay byte-aligned with it; missing
+  this the first time broke `TestImportedMethodOrder` by desyncing
+  everything read after it for generic methods specifically.
+
+**Verified:** beyond the usual full `./make.bash` three-stage bootstrap,
+`go test` across `cmd/compile/...` (including `cmd/compile/internal/types2`
+and `cmd/compile/internal/types`, both of which caught real regressions
+during development -- the method-order desync and the `Type` size growth,
+respectively -- before the stdlib build/vet pass would have), `go build
+std cmd`, `go vet std`, and a stdlib spot-check (`reflect`, `go/types`,
+`go/importer`, `encoding/json`, `net/http`, `errors`, `fmt`, `sort`,
+`strings`) -- all clean. Then the actual empirical fix, end to end: a
+type with one method genuinely looked up via `reflect.Value.MethodByName`
+(a non-constant name) and a second, `//golf:noreflect`-exempted method
+that is never looked up that way. Built and *run*: the genuinely-reflected
+method resolves and calls correctly; `go tool nm` and `strings` on the
+binary confirm the exempted method's function body is completely absent,
+while an equivalent program with no directive at all keeps both methods,
+exactly matching §2's original investigation.
 
 ## 3. Memory management modes
 

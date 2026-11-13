@@ -872,6 +872,10 @@ func (pr *pkgReader) objIdxMayFail(idx index, implicits, explicits []*types.Type
 			typ.SetMethods(methods)
 		}
 
+		if names := r.Strings(); len(names) > 0 { // golf: see writer.go's matching w.Strings
+			typ.SetGolfNoReflectMethods(names)
+		}
+
 		if !r.dict.shaped {
 			r.needWrapper(typ)
 		}

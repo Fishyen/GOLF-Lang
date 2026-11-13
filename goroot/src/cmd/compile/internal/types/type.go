@@ -211,6 +211,34 @@ type Type struct {
 	ptrBytes int64
 }
 
+// golfNoReflectMethods records, for the rare *Type that has one, the
+// method names named by its //golf:noreflect(Name, ...) directive
+// (DESIGN.md §2). Validated by noder
+// (cmd/compile/internal/noder.checkGolfNoReflect) before reaching
+// here; reflectdata reads it when emitting this type's method table,
+// to let the linker's deadcode pass drop these specific methods even
+// when reflection elsewhere would otherwise force retaining the
+// type's whole method set.
+//
+// Kept as a side map rather than a field directly on Type: almost
+// every compiled Type has no directive, and Type is large and
+// extremely hot (allocated for every type the compiler ever touches),
+// so a nil-by-default field would add 24 bytes to all of them for a
+// feature only a handful ever use. Not safe for concurrent use -- see
+// the same tradeoff and non-concurrency in cmd/compile's other global
+// compile-time side tables (e.g. signatmu-guarded ones in reflectdata
+// aside, most of cmd/compile's own type-checking state isn't
+// goroutine-safe either).
+var golfNoReflectMethods = map[*Type][]string{}
+
+// GolfNoReflectMethods returns the method names t's //golf:noreflect
+// directive names, or nil if it has none.
+func (t *Type) GolfNoReflectMethods() []string { return golfNoReflectMethods[t] }
+
+// SetGolfNoReflectMethods records names as t's validated
+// //golf:noreflect method list.
+func (t *Type) SetGolfNoReflectMethods(names []string) { golfNoReflectMethods[t] = names }
+
 // Registers returns the number of integer and floating-point
 // registers required to represent a parameter of this type under the
 // ABIInternal calling conventions.

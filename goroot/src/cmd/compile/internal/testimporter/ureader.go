@@ -529,6 +529,15 @@ func (pr *pkgReader) objIdx(idx pkgbits.Index) (*types2.Package, string) {
 						methods = append(methods, indexedMethod{idx, m})
 					}
 
+					// golf: //golf:noreflect method list, written right
+					// after the ordinary (non-generic) methods and
+					// before the generic-methods block below, which is
+					// why it's read here rather than after this whole
+					// if/else -- not needed by this reader, see
+					// types.Type.GolfNoReflectMethods in cmd/compile
+					// proper.
+					_ = r.Strings()
+
 					// generic methods
 					for range r.Len() {
 						// Careful: objIdx is used to read in package-scoped declarations, which

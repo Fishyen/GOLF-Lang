@@ -30,6 +30,14 @@ type deadcodePass struct {
 	reflectSeen        bool               // whether we have seen a reflect method call
 	dynlink            bool
 
+	// golfExemptCache memoizes, per receiver type symbol, the set of
+	// method names its //golf:noreflect directive named (DESIGN.md
+	// §2), decoded from the ".golfnoreflect" auxiliary symbol
+	// cmd/compile/internal/reflectdata emits for such a type. A type
+	// with no directive has no entry here (golfExempt returns false
+	// for it directly, without an entry). nil until first used.
+	golfExemptCache map[loader.Sym]map[string]bool
+
 	methodsigstmp []methodsig // scratch buffer for decoding method signatures
 	pkginits      []loader.Sym
 	mapinitnoop   loader.Sym
@@ -392,6 +400,79 @@ func (d *deadcodePass) dumpDepAddFlags(name string, symIdx loader.Sym) string {
 	return name
 }
 
+// golfNoReflectSymName returns the name of the auxiliary symbol
+// cmd/compile/internal/reflectdata.writeGolfNoReflectMethods emits
+// for the type whose descriptor symbol is named typeSymName (e.g.
+// "type:main.Entity" -> "type:.golfnoreflect.main.Entity"), or "" if
+// typeSymName isn't a type descriptor symbol name at all. The two
+// sides of this naming convention -- here and in reflectdata -- have
+// to be kept in sync by hand, since cmd/link can't import anything
+// from cmd/compile. See DESIGN.md §2.
+func golfNoReflectSymName(typeSymName string) string {
+	const prefix = "type:"
+	rest, ok := strings.CutPrefix(typeSymName, prefix)
+	if !ok {
+		return ""
+	}
+	// *T's own type descriptor gets a separate methodref (and so a
+	// separate probe) from T's, but shares T's exempt list under T's
+	// symbol name (reflectdata.writeGolfNoReflectMethods resolves to
+	// the base type for the same reason) -- strip the leading "*" so
+	// both variants compute the same probe name.
+	rest = strings.TrimPrefix(rest, "*")
+	return prefix + ".golfnoreflect." + rest
+}
+
+// golfExempt reports whether m's receiver type has a
+// //golf:noreflect directive naming m.m.name, i.e. whether m should
+// be skipped when it would otherwise only be retained by the
+// reflectSeen fallback (DESIGN.md §2). It never affects retention via
+// a genuinely-reached interface's method set (d.ifaceMethod) or a
+// generic interface call (d.genericIfaceMethod) -- the directive only
+// asserts "never looked up via reflection," not "never reachable at
+// all," so those real reachability paths are untouched.
+func (d *deadcodePass) golfExempt(m methodref) bool {
+	if d.golfExemptCache == nil {
+		d.golfExemptCache = make(map[loader.Sym]map[string]bool)
+	}
+	names, ok := d.golfExemptCache[m.src]
+	if !ok {
+		names = d.decodeGolfExempt(m.src)
+		d.golfExemptCache[m.src] = names
+	}
+	return names[m.m.name]
+}
+
+// decodeGolfExempt looks up and decodes typeSym's ".golfnoreflect"
+// auxiliary symbol, if it has one. The encoding is a back-to-back run
+// of (1-byte length, name bytes) pairs with no count prefix; see
+// reflectdata.writeGolfNoReflectMethods.
+func (d *deadcodePass) decodeGolfExempt(typeSym loader.Sym) map[string]bool {
+	auxName := golfNoReflectSymName(d.ldr.SymName(typeSym))
+	if auxName == "" {
+		return nil
+	}
+	auxSym := d.ldr.Lookup(auxName, 0)
+	if auxSym == 0 {
+		return nil
+	}
+	data := d.ldr.Data(auxSym)
+	var names map[string]bool
+	for len(data) > 0 {
+		n := int(data[0])
+		data = data[1:]
+		if n > len(data) {
+			break // malformed; shouldn't happen, just stop rather than panic
+		}
+		if names == nil {
+			names = make(map[string]bool)
+		}
+		names[string(data[:n])] = true
+		data = data[n:]
+	}
+	return names
+}
+
 func (d *deadcodePass) markMethod(m methodref) {
 	relocs := d.ldr.Relocs(m.src)
 	d.mark(relocs.At(m.r).Sym(), m.src)
@@ -459,7 +540,8 @@ func deadcode(ctxt *Link) {
 		// in the last pass.
 		rem := d.markableMethods[:0]
 		for _, m := range d.markableMethods {
-			if (d.reflectSeen && (m.isExported() || d.dynlink)) || d.ifaceMethod[m.m] || d.genericIfaceMethod[m.m.name] {
+			reflectRetained := (d.reflectSeen && (m.isExported() || d.dynlink)) && !d.golfExempt(m)
+			if reflectRetained || d.ifaceMethod[m.m] || d.genericIfaceMethod[m.m.name] {
 				d.markMethod(m)
 			} else {
 				rem = append(rem, m)
