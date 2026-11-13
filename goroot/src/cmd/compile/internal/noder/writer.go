@@ -2804,6 +2804,10 @@ type typeDeclGen struct {
 
 type fileImports struct {
 	importedEmbed, importedUnsafe bool
+
+	// golfMode is this file's //golf:mem mode ("gc" or "manual"),
+	// used to enforce manual mode's reduced feature set.
+	golfMode string
 }
 
 // declCollector is a visitor type that collects compiler-needed
@@ -2901,6 +2905,11 @@ func (c *declCollector) Visit(n syntax.Node) syntax.Visitor {
 			copy.withinFunc = true
 			return &copy
 		}
+
+	case *syntax.MapType:
+		if c.file.golfMode == "manual" {
+			c.pw.errorf(n, "map type not allowed in manual-mode file (//golf:mem(manual)); see DESIGN.md")
+		}
 	}
 
 	return c
@@ -2909,7 +2918,7 @@ func (c *declCollector) Visit(n syntax.Node) syntax.Visitor {
 func (pw *pkgWriter) collectDecls(noders []*noder) {
 	var typegen int
 	for _, p := range noders {
-		var file fileImports
+		file := fileImports{golfMode: p.golfMode}
 
 		syntax.Walk(p.file, &declCollector{
 			pw:      pw,
