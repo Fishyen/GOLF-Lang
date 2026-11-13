@@ -84,9 +84,33 @@ assume a GC and don't have an obvious manual-mode equivalent yet:
 For v1, manual-mode files should be expected to work with a **smaller
 language surface** than GC-mode files — closer to "C with Go syntax" for
 anything that would otherwise rely on hidden GC support. This is an accepted
-tradeoff for v1, not something to paper over with hidden allocations. Each
-of these (closures, interfaces, map) needs its own manual-mode story before
-v1 ships; none are designed yet.
+tradeoff for v1, not something to paper over with hidden allocations.
+
+**Status:** all three restrictions (map, closures, interfaces) are enforced
+by the compiler as of this writing -- a `//golf:mem(manual)` file that uses
+any of them fails to compile.
+
+### 3.5 Manual allocator (`golf.Alloc`/`golf.Free`)
+
+The `golf` package (`src/golf/alloc.go`) provides `Alloc[T]() *T` and
+`Free[T](*T)`, backed by `mmap`/`munmap` directly -- memory that Go's GC
+never scans or tracks. This is the allocator manual-mode code is meant to
+use.
+
+**Not yet done:** this package is not gated to manual-mode files only; any
+file can import and call it today. Gating it (or deciding it's fine to allow
+everywhere) is cross-mode-ownership work (§3.3) that hasn't landed yet.
+
+**Open hazard, not solved by v1:** nothing currently stops a program from
+storing a GC-managed value (a string, slice, pointer into the Go heap --
+maps/interfaces are separately disallowed per §3.4) inside memory obtained
+from `golf.Alloc`. Since the GC doesn't scan that memory, such a value's
+referent can be collected while still referenced from inside the manual
+allocation, corrupting the program. This is the same hazard malloc'd memory
+has in any GC'd language; this document doesn't yet have an answer for it
+(a possible future direction: extend the manual-mode restrictions to forbid
+storing GC-tracked pointer kinds in manual-mode struct fields, but this
+isn't designed).
 
 ## 4. Open questions / not yet decided
 

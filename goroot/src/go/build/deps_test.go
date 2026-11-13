@@ -794,6 +794,11 @@ var depsRules = `
 	syscall
 	< os/exec/internal/fdtest;
 
+	# golf is GOLF's manual memory-management package: Alloc/Free via
+	# mmap/munmap, outside the GC heap.
+	syscall, unsafe
+	< golf;
+
 	FMT, sort
 	< internal/diff;
 
