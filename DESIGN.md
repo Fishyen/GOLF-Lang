@@ -23,10 +23,45 @@ not a locked spec — details (especially syntax) are placeholders.
 ## 2. Selective linking (library embedding)
 
 The compiler should only emit the functions/types actually reachable from a
-program's call graph, rather than linking a whole package. This is a
-transitive reachability analysis over module boundaries. Not expanded on
-yet beyond being a stated goal — revisit once the memory-mode system is
-settled, since import handling may interact with per-file mode metadata.
+program's call graph, rather than linking a whole package.
+
+**Investigated (2026-11-13), before building anything:** this goal is
+already substantially met by Go's stock linker, inherited as-is by GOLF.
+Empirically (via `go tool nm` / `strings` on built binaries, inlining
+disabled to get a clean signal):
+- An unused free function in an imported package is fully eliminated,
+  including any string literals or calls it alone was responsible for.
+- An unused *type* (never constructed anywhere reachable) is eliminated
+  entirely, methods included.
+- A *used* type's unused methods are eliminated individually -- even when
+  the type is stored in an interface alongside other implementations, and
+  even with `reflect` imported and used elsewhere in the program (e.g.
+  `reflect.TypeOf`, or `reflect.Value.MethodByName` called on an
+  *unrelated* type, even with a non-constant method-name string).
+
+**The one real gap found:** when a value of type `T` itself flows into a
+`reflect.Value` (e.g. `reflect.ValueOf(t)`) anywhere reachable, and that
+`reflect.Value` is used for *dynamic* method lookup (`MethodByName` with a
+non-constant string -- a constant string lets the linker resolve it
+statically, same as a direct call), the linker falls back to retaining
+**every exported method of `T`**, whether or not that specific method is
+ever actually invoked. This is the realistic case that matters for a
+game: a reflection-driven save system, network RPC dispatcher, or
+scripting/ECS binding that walks a struct's methods by name pulls in the
+whole method set of every type it ever touches, not just the methods
+actually exercised at runtime.
+
+**Revised scope:** "selective linking" for GOLF is not "build a
+reachability analysis from scratch" -- duplicating a solid pass the
+linker already does well -- but closing this one specific gap: giving the
+programmer a way to tell the compiler/linker exactly which methods a
+reflection-driven caller actually needs for a given type, so the rest of
+that type's exported methods stay eligible for the dead-code elimination
+they'd otherwise lose. Exact mechanism (a directive on the type, a
+build-time manifest, something else) not yet decided -- this would also
+be a `cmd/link` deadcode-pass change, a different part of the toolchain
+than everything built so far this session (which has all been
+frontend/type-checking work), and not yet attempted.
 
 ## 3. Memory management modes
 
