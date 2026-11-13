@@ -3016,20 +3016,47 @@ func calleeFunc(info *types2.Info, fun syntax.Expr) (*types2.Func, bool) {
 
 // golfBoundaryKind classifies a type for GOLF's copy-at-boundary check
 // (DESIGN.md §3.3): "ptr" for pointer types, "slice" for slice types
-// (both hold an implicit reference that the copy-at-boundary rule
-// cares about), or "" for anything else (e.g. scalars, arrays,
-// structs with no indirection -- Go's by-value call semantics already
-// make those safe to pass across a mode boundary; see DESIGN.md's
-// named gap for structs that themselves contain pointer fields).
+// (both hold an implicit reference the rule cares about), "struct"
+// for a struct type that itself contains no top-level indirection but
+// has a field (at any depth, recursively) that does, or "" for
+// anything else (scalars, arrays of scalars, structs with no
+// indirection anywhere inside them -- Go's by-value call semantics
+// already make those safe to pass across a mode boundary).
+//
+// Map- and interface-typed fields are not detected here: manual-mode
+// files can't declare either (DESIGN.md §3.4), so the main case this
+// would catch -- a manual-mode struct smuggling a shared reference
+// across the boundary -- can't arise; a GC-mode struct's map/interface
+// field crossing into manual code unflagged remains a named gap.
 func golfBoundaryKind(t types2.Type) string {
-	if t == nil {
+	return golfBoundaryKindDepth(t, 0)
+}
+
+// golfBoundaryKindDepth is golfBoundaryKind's recursive worker. depth
+// guards against pathological nesting; ordinary recursive struct
+// definitions (e.g. a linked list's Node{Next *Node}) don't need it,
+// since the *types2.Pointer case below never recurses into its
+// pointee -- only an actual chain of distinct struct-within-struct
+// fields grows depth.
+func golfBoundaryKindDepth(t types2.Type, depth int) string {
+	if t == nil || depth > 32 {
 		return ""
 	}
-	switch t.Underlying().(type) {
+	switch u := t.Underlying().(type) {
 	case *types2.Pointer:
 		return "ptr"
 	case *types2.Slice:
 		return "slice"
+	case *types2.Struct:
+		for i := 0; i < u.NumFields(); i++ {
+			if golfBoundaryKindDepth(u.Field(i).Type(), depth+1) != "" {
+				return "struct"
+			}
+		}
+	case *types2.Array:
+		if golfBoundaryKindDepth(u.Elem(), depth+1) != "" {
+			return "struct"
+		}
 	}
 	return ""
 }
@@ -3044,6 +3071,8 @@ func golfWrapperNames(kind string) (copyName, transferName string) {
 		return "Copy", "Transfer"
 	case "slice":
 		return "CopySlice", "TransferSlice"
+	case "struct":
+		return "CopyValue", "TransferValue"
 	}
 	return "", ""
 }
@@ -3054,6 +3083,8 @@ func golfKindLabel(kind string) string {
 		return "pointer"
 	case "slice":
 		return "slice"
+	case "struct":
+		return "struct or array (containing a pointer or slice field)"
 	}
 	return kind
 }
@@ -3077,7 +3108,7 @@ func isAnyGolfWrapper(f *types2.Func) bool {
 		return false
 	}
 	switch f.Name() {
-	case "Copy", "Transfer", "CopySlice", "TransferSlice":
+	case "Copy", "Transfer", "CopySlice", "TransferSlice", "CopyValue", "TransferValue":
 		return true
 	}
 	return false

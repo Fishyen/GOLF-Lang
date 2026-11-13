@@ -795,8 +795,10 @@ var depsRules = `
 	< os/exec/internal/fdtest;
 
 	# golf is GOLF's manual memory-management package: Alloc/Free via
-	# mmap/munmap, outside the GC heap.
-	syscall, unsafe
+	# mmap/munmap, outside the GC heap, plus CopyValue/TransferValue's
+	# reflect-based recursive struct copy for the copy-at-boundary rule
+	# (DESIGN.md §3.3).
+	syscall, unsafe, reflect
 	< golf;
 
 	FMT, sort

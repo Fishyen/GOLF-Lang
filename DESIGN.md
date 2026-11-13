@@ -113,11 +113,29 @@ only take one value, so there is no syntax yet to make a multi-result
 crossing explicit) rather than a silent gap -- it must be restructured
 into single-result calls to cross the boundary at all.
 
+**Status update:** a struct (or array) that itself has no top-level
+indirection but contains a pointer or slice field somewhere inside it --
+at any depth, recursively -- is now also checked, via
+`golf.CopyValue[T]`/`golf.TransferValue[T]`. Unlike `Copy`/`CopySlice`,
+which only copy one level, `CopyValue` copies *recursively*: every
+pointer or slice reachable from the value, through any number of nested
+structs/slices/arrays, gets its own fresh copy (implemented with
+`reflect`, including unexported fields via `unsafe`, since there's no way
+to wrap an individual inner field at the call site the way there is for a
+bare pointer argument). A plain struct with no indirection anywhere inside
+it (e.g. `struct{ A, B int }`) is unaffected -- Go's by-value call
+semantics already make it safe. Recursive type definitions (e.g. a linked
+list's `Node{Next *Node}`) classify fine and don't risk infinite
+recursion, since the check never follows a pointer into its pointee, only
+drills into a struct's or array's *own* fields/elements.
+
 **Not yet done (named gaps, not solved by v1):**
-- Struct fields that themselves hold a pointer or slice still cross
-  boundaries unchecked when the struct itself is passed by value -- the
-  same hazard noted in §3.5 for `golf.Alloc`. Catching this needs walking
-  into field types recursively, which hasn't been done yet.
+- Map- and interface-typed fields inside a crossing struct aren't
+  detected or deep-copied. The main case this would matter for -- a
+  manual-mode-declared struct smuggling one across -- can't arise, since
+  manual-mode files can't declare map or interface types at all (§3.4);
+  what's left unchecked is a GC-mode struct's map/interface field
+  crossing into manual code.
 - The check only looks at calls within the same package. Detecting a
   crossing into another package's differently-moded file would need that
   file's `//golf:mem` mode to be recorded in the package's export data (it
