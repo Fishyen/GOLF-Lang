@@ -87,6 +87,12 @@ type pkgWriter struct {
 	typDecls  map[*types2.TypeName]typeDeclGen
 	methodIdx map[*types2.Func]int // method declaration order, for x/tools decoder (#81188)
 
+	// funcGolfMode records the //golf:mem mode of the file each
+	// package-level function was declared in, so that calls crossing
+	// between differently-moded files within this package can be
+	// detected. See golf DESIGN.md §3.3.
+	funcGolfMode map[*types2.Func]string
+
 	// linknames maps package-scope objects to their linker symbol name,
 	// if specified by a //go:linkname or //go:linknamestd directive.
 	linknames map[types2.Object]struct {
@@ -119,6 +125,8 @@ func newPkgWriter(m posMap, pkg *types2.Package, info *types2.Info, otherInfo ma
 		funDecls:  make(map[*types2.Func]*syntax.FuncDecl),
 		typDecls:  make(map[*types2.TypeName]typeDeclGen),
 		methodIdx: make(map[*types2.Func]int),
+
+		funcGolfMode: make(map[*types2.Func]string),
 
 		linknames: make(map[types2.Object]struct {
 			remote string
@@ -2941,9 +2949,85 @@ func (c *declCollector) Visit(n syntax.Node) syntax.Visitor {
 				}
 			}
 		}
+
+	case *syntax.CallExpr:
+		if callee, ok := calleeFunc(pw.info, n.Fun); ok {
+			if calleeMode, ok := pw.funcGolfMode[callee]; ok && calleeMode != c.file.golfMode {
+				for _, arg := range n.ArgList {
+					checkGolfBoundaryArg(pw, arg)
+				}
+			}
+		}
 	}
 
 	return c
+}
+
+// collectFuncGolfModes populates pw.funcGolfMode for every
+// package-level function declaration across all of the package's
+// files, independent of declaration order.
+func (pw *pkgWriter) collectFuncGolfModes(noders []*noder) {
+	for _, p := range noders {
+		for _, decl := range p.file.DeclList {
+			fd, ok := decl.(*syntax.FuncDecl)
+			if !ok {
+				continue
+			}
+			if obj, ok := pw.info.Defs[fd.Name].(*types2.Func); ok {
+				pw.funcGolfMode[obj] = p.golfMode
+			}
+		}
+	}
+}
+
+// calleeFunc returns the *types2.Func a call expression's function
+// operand resolves to, if it is a direct reference to a declared
+// function (not a value of function type).
+func calleeFunc(info *types2.Info, fun syntax.Expr) (*types2.Func, bool) {
+	var name *syntax.Name
+	switch fun := syntax.Unparen(fun).(type) {
+	case *syntax.Name:
+		name = fun
+	case *syntax.SelectorExpr:
+		name = fun.Sel
+	default:
+		return nil, false
+	}
+	obj, ok := info.Uses[name]
+	if !ok {
+		return nil, false
+	}
+	f, ok := obj.(*types2.Func)
+	return f, ok
+}
+
+// checkGolfBoundaryArg enforces GOLF's copy-at-boundary rule
+// (DESIGN.md §3.3): a pointer-typed argument passed across a call
+// that crosses between a gc-mode and a manual-mode file must be the
+// direct result of golf.Copy or golf.Transfer, making the ownership
+// decision explicit at the call site rather than implicit.
+func checkGolfBoundaryArg(pw *pkgWriter, arg syntax.Expr) {
+	tv, ok := pw.maybeTypeAndValue(arg)
+	if !ok || tv.Type == nil {
+		return
+	}
+	if _, isPtr := tv.Type.Underlying().(*types2.Pointer); !isPtr {
+		return
+	}
+
+	call, ok := syntax.Unparen(arg).(*syntax.CallExpr)
+	if ok {
+		if f, ok := calleeFunc(pw.info, call.Fun); ok {
+			if pkg := f.Pkg(); pkg != nil && pkg.Path() == "golf" {
+				switch f.Name() {
+				case "Copy", "Transfer":
+					return
+				}
+			}
+		}
+	}
+
+	pw.errorf(arg, "implicit cross-mode pointer argument not allowed; wrap in golf.Copy(...) or golf.Transfer(...) to make ownership explicit; see DESIGN.md §3.3")
 }
 
 // scopeContains reports whether ancestor is s itself or one of s's
@@ -2960,6 +3044,14 @@ func scopeContains(ancestor, s *types2.Scope) bool {
 }
 
 func (pw *pkgWriter) collectDecls(noders []*noder) {
+	// Record every package-level function's declaring-file golf mode
+	// up front, in a pass separate from the main declCollector walk
+	// below. The golf:mem cross-mode boundary check (in that walk's
+	// *syntax.CallExpr case) needs a callee's mode regardless of
+	// whether its declaring file comes before or after the caller's
+	// in noders; collectFuncGolfModes removes that ordering dependency.
+	pw.collectFuncGolfModes(noders)
+
 	var typegen int
 	for _, p := range noders {
 		file := fileImports{golfMode: p.golfMode}

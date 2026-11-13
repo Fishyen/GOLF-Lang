@@ -71,6 +71,48 @@ passes a slice into a manual-mode function, or vice versa), the boundary
   real cases — e.g. a manual renderer handing a result back up to GC-managed
   game logic).
 
+**Status:** implemented for direct pointer-typed call arguments.
+`golf.Copy[T](*T) *T` and `golf.Transfer[T](*T) *T` (package `golf`, see
+§3.5) are the "copy" and "transfer" primitives. The compiler now rejects a
+call where the caller's file mode and the callee's declaring-file mode
+differ (checked only within the same package for v1) and a pointer-typed
+argument is passed bare -- it must be the direct result of a `golf.Copy(…)`
+or `golf.Transfer(…)` call instead:
+
+```go
+//golf:mem(manual)
+package renderer
+
+func Render(p *Point) { ... }
+```
+
+```go
+package game
+import "golf"
+
+func update() {
+    p := &Point{X: 1, Y: 2}
+    renderer.Render(golf.Copy(p))      // ok: explicit copy
+    renderer.Render(golf.Transfer(p))  // ok: explicit handoff; p must not
+                                        // be used by this file again
+    renderer.Render(p)                 // compile error: bare pointer
+}
+```
+
+**Not yet done (named gaps, not solved by v1):**
+- Only direct pointer arguments at call sites are checked. Slices, and
+  struct fields that themselves hold pointers, cross boundaries unchecked
+  -- the same hazard noted in §3.5 for `golf.Alloc`.
+- Return values are not checked: a manual-mode function returning a
+  pointer to a GC-mode caller (or vice versa) is not yet caught.
+- The check only looks at calls within the same package; crossing a
+  package boundary into a differently-moded file in another package isn't
+  detected.
+- `golf.Alloc`/`golf.Free` are still not gated to manual-mode files (see
+  §3.5) -- this was a deliberate decision to preserve interoperability,
+  not an oversight. `golf.Copy`/`golf.Transfer` are plain generic functions
+  usable from any file for the same reason.
+
 ### 3.4 Manual mode is a stricter dialect
 
 Manual mode is not just "GC mode plus malloc/free." Several Go features
@@ -97,9 +139,12 @@ The `golf` package (`src/golf/alloc.go`) provides `Alloc[T]() *T` and
 never scans or tracks. This is the allocator manual-mode code is meant to
 use.
 
-**Not yet done:** this package is not gated to manual-mode files only; any
-file can import and call it today. Gating it (or deciding it's fine to allow
-everywhere) is cross-mode-ownership work (§3.3) that hasn't landed yet.
+**Decision:** this package is not gated to manual-mode files, and will stay
+that way -- any file may import and call it. Restricting it would hurt
+interoperability (e.g. a GC-mode file that wants one manually-managed
+buffer) for no correctness benefit once §3.3's copy-at-boundary check
+covers pointer arguments crossing modes; it simply isn't *necessary* in a
+gc-mode file, not forbidden.
 
 **Open hazard, not solved by v1:** nothing currently stops a program from
 storing a GC-managed value (a string, slice, pointer into the Go heap --
@@ -115,9 +160,6 @@ isn't designed).
 ## 4. Open questions / not yet decided
 
 - Exact directive syntax (file-level and per-allocation).
-- Exact transfer-ownership syntax for the cross-mode escape hatch.
-- Manual-mode equivalents (or restrictions) for closures, interfaces, and
-  `map`.
 - How selective linking's reachability analysis interacts with per-file
   memory-mode metadata.
 - RSR design itself (explicitly deferred past v1).
