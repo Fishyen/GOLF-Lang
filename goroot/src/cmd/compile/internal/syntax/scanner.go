@@ -733,18 +733,51 @@ func (s *scanner) lineComment() {
 		return
 	}
 
-	// recognize go: or line directives
-	prefix := "go:"
+	// recognize go:, golf:, or line directives.
+	// go: and golf: share a leading "g", so track both candidate
+	// prefixes at once rather than committing to one and failing to
+	// backtrack (the scanner stream can't be rewound).
 	if s.ch == 'l' {
-		prefix = "line "
-	}
-	for _, m := range prefix {
-		if s.ch != m {
-			s.stop()
-			s.skipLine()
-			return
+		const prefix = "line "
+		for _, m := range prefix {
+			if s.ch != m {
+				s.stop()
+				s.skipLine()
+				return
+			}
+			s.nextch()
 		}
-		s.nextch()
+	} else {
+		candidates := []string{"go:", "golf:"}
+		i := 0
+		for {
+			var live []string
+			for _, c := range candidates {
+				if i < len(c) && byte(s.ch) == c[i] {
+					live = append(live, c)
+				}
+			}
+			candidates = live
+			if len(candidates) == 0 {
+				s.stop()
+				s.skipLine()
+				return
+			}
+			i++
+			// If the shortest surviving candidate is fully matched,
+			// and it's not a strict prefix of another surviving one,
+			// we're done.
+			done := false
+			for _, c := range candidates {
+				if i == len(c) {
+					done = true
+				}
+			}
+			s.nextch()
+			if done {
+				break
+			}
+		}
 	}
 
 	// directive text

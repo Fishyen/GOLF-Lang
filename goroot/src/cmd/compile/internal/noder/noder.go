@@ -70,6 +70,7 @@ func LoadPackage(filenames []string) {
 			base.ErrorExit()
 		}
 		lines += p.file.EOF.Line()
+		p.golfMode = golfFileMode(p.file)
 	}
 	base.Timer.AddEvent(int64(lines), "lines")
 
@@ -101,6 +102,13 @@ type noder struct {
 	linknames  []linkname
 	pragcgobuf [][]string
 	err        chan syntax.Error
+
+	// golfMode is the file's memory-management mode, parsed from an
+	// optional //golf:mem(gc|manual) directive before the package clause.
+	// It defaults to "gc" when no directive is present, so unmodified Go
+	// source stays GC-mode by default. It is not yet consulted by the
+	// rest of the compiler.
+	golfMode string
 }
 
 // linkname records a //go:linkname or //go:linknamestd directive.
@@ -173,6 +181,12 @@ type pragmas struct {
 	Embeds     []pragmaEmbed
 	WasmImport *WasmImport
 	WasmExport *WasmExport
+
+	// GolfMem holds the mode named by a //golf:mem(gc|manual) directive,
+	// or "" if none was seen. Only meaningful when attached to the
+	// package clause (i.e. the file-level pragma).
+	GolfMem    string
+	GolfMemPos syntax.Pos
 }
 
 func (p *pragmas) Nointerface() bool {
@@ -218,6 +232,9 @@ func (p *noder) checkUnusedDuringParse(pragma *pragmas) {
 	}
 	if pragma.WasmExport != nil {
 		p.error(syntax.Error{Pos: pragma.WasmExport.Pos, Msg: "misplaced go:wasmexport directive"})
+	}
+	if pragma.GolfMem != "" {
+		p.error(syntax.Error{Pos: pragma.GolfMemPos, Msg: "misplaced //golf:mem directive; must precede the package clause"})
 	}
 }
 
@@ -312,6 +329,19 @@ func (p *noder) pragma(pos syntax.Pos, blankLine bool, text string, old syntax.P
 		}
 		pragma.Embeds = append(pragma.Embeds, pragmaEmbed{pos, args})
 
+	case strings.HasPrefix(text, "golf:mem("):
+		mode, err := parseGolfMem(text)
+		if err != nil {
+			p.error(syntax.Error{Pos: pos, Msg: err.Error()})
+			break
+		}
+		if pragma.GolfMem != "" && pragma.GolfMem != mode {
+			p.error(syntax.Error{Pos: pos, Msg: "conflicting //golf:mem directives"})
+			break
+		}
+		pragma.GolfMem = mode
+		pragma.GolfMemPos = pos
+
 	case strings.HasPrefix(text, "go:cgo_import_dynamic "):
 		// This is permitted for general use because Solaris
 		// code relies on it in golang.org/x/sys/unix and others.
@@ -356,6 +386,38 @@ func (p *noder) pragma(pos syntax.Pos, blankLine bool, text string, old syntax.P
 	}
 
 	return pragma
+}
+
+// golfModeGC is the default memory-management mode for a file that
+// carries no //golf:mem directive, so plain Go source compiles under
+// GOLF exactly as it did under stock Go.
+const golfModeGC = "gc"
+
+// parseGolfMem parses the argument of a "golf:mem(...)" directive text
+// (e.g. "golf:mem(manual)") and validates it names a known mode.
+func parseGolfMem(text string) (string, error) {
+	rest := strings.TrimPrefix(text, "golf:mem(")
+	i := strings.IndexByte(rest, ')')
+	if i < 0 || i != len(rest)-1 {
+		return "", fmt.Errorf("usage: //golf:mem(gc|manual)")
+	}
+	mode := rest[:i]
+	switch mode {
+	case "gc", "manual":
+		return mode, nil
+	default:
+		return "", fmt.Errorf("unknown //golf:mem mode %q; want gc or manual", mode)
+	}
+}
+
+// golfFileMode returns f's memory-management mode, as set by a
+// //golf:mem(gc|manual) directive before the package clause, defaulting
+// to golfModeGC when none is present.
+func golfFileMode(f *syntax.File) string {
+	if p, ok := f.Pragma.(*pragmas); ok && p.GolfMem != "" {
+		return p.GolfMem
+	}
+	return golfModeGC
 }
 
 // isCgoGeneratedFile reports whether pos is in a file

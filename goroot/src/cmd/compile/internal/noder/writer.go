@@ -2839,7 +2839,7 @@ func (c *declCollector) Visit(n syntax.Node) syntax.Visitor {
 
 	switch n := n.(type) {
 	case *syntax.File:
-		pw.checkPragmas(n.Pragma, ir.GoBuildPragma, false)
+		pw.checkPragmasGolfMem(n.Pragma, ir.GoBuildPragma, false, true)
 
 	case *syntax.ImportDecl:
 		pw.checkPragmas(n.Pragma, 0, false)
@@ -2954,6 +2954,13 @@ func (pw *pkgWriter) collectDecls(noders []*noder) {
 }
 
 func (pw *pkgWriter) checkPragmas(p syntax.Pragma, allowed ir.PragmaFlag, embedOK bool) {
+	pw.checkPragmasGolfMem(p, allowed, embedOK, false)
+}
+
+// checkPragmasGolfMem is checkPragmas, plus a fileLevel flag: a
+// //golf:mem directive is only valid when attached to the package
+// clause (the file-level pragma); anywhere else it is misplaced.
+func (pw *pkgWriter) checkPragmasGolfMem(p syntax.Pragma, allowed ir.PragmaFlag, embedOK bool, fileLevel bool) {
 	if p == nil {
 		return
 	}
@@ -2969,6 +2976,10 @@ func (pw *pkgWriter) checkPragmas(p syntax.Pragma, allowed ir.PragmaFlag, embedO
 		for _, e := range pragma.Embeds {
 			pw.errorf(e.Pos, "misplaced go:embed directive")
 		}
+	}
+
+	if pragma.GolfMem != "" && !fileLevel {
+		pw.errorf(pragma.GolfMemPos, "misplaced //golf:mem directive; must precede the package clause")
 	}
 }
 
