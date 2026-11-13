@@ -93,6 +93,12 @@ type pkgWriter struct {
 	// detected. See golf DESIGN.md §3.3.
 	funcGolfMode map[*types2.Func]string
 
+	// golfReturnExempt marks a *syntax.CallExpr that appears as the
+	// direct argument of a golf.Copy or golf.Transfer call, exempting
+	// it from the cross-mode return-value check: its result is already
+	// being made explicit by the wrapping call. See DESIGN.md §3.3.
+	golfReturnExempt map[*syntax.CallExpr]bool
+
 	// linknames maps package-scope objects to their linker symbol name,
 	// if specified by a //go:linkname or //go:linknamestd directive.
 	linknames map[types2.Object]struct {
@@ -126,7 +132,8 @@ func newPkgWriter(m posMap, pkg *types2.Package, info *types2.Info, otherInfo ma
 		typDecls:  make(map[*types2.TypeName]typeDeclGen),
 		methodIdx: make(map[*types2.Func]int),
 
-		funcGolfMode: make(map[*types2.Func]string),
+		funcGolfMode:     make(map[*types2.Func]string),
+		golfReturnExempt: make(map[*syntax.CallExpr]bool),
 
 		linknames: make(map[types2.Object]struct {
 			remote string
@@ -2952,9 +2959,17 @@ func (c *declCollector) Visit(n syntax.Node) syntax.Visitor {
 
 	case *syntax.CallExpr:
 		if callee, ok := calleeFunc(pw.info, n.Fun); ok {
+			if isGolfOwnershipFunc(callee) && len(n.ArgList) == 1 {
+				if inner, ok := syntax.Unparen(n.ArgList[0]).(*syntax.CallExpr); ok {
+					pw.golfReturnExempt[inner] = true
+				}
+			}
 			if calleeMode, ok := pw.funcGolfMode[callee]; ok && calleeMode != c.file.golfMode {
 				for _, arg := range n.ArgList {
 					checkGolfBoundaryArg(pw, arg)
+				}
+				if !pw.golfReturnExempt[n] && calleeSinglePointerResult(callee) {
+					pw.errorf(n, "implicit cross-mode pointer return value not allowed; wrap the call in golf.Copy(...) or golf.Transfer(...) to make ownership explicit; see DESIGN.md §3.3")
 				}
 			}
 		}
@@ -3001,6 +3016,36 @@ func calleeFunc(info *types2.Info, fun syntax.Expr) (*types2.Func, bool) {
 	return f, ok
 }
 
+// isGolfOwnershipFunc reports whether f is golf.Copy or golf.Transfer,
+// GOLF's explicit cross-mode ownership primitives (DESIGN.md §3.3).
+func isGolfOwnershipFunc(f *types2.Func) bool {
+	pkg := f.Pkg()
+	if pkg == nil || pkg.Path() != "golf" {
+		return false
+	}
+	switch f.Name() {
+	case "Copy", "Transfer":
+		return true
+	}
+	return false
+}
+
+// calleeSinglePointerResult reports whether f has exactly one result
+// and that result's type is a pointer. Multi-result functions are not
+// checked for cross-mode return crossing in v1; see DESIGN.md §3.3.
+func calleeSinglePointerResult(f *types2.Func) bool {
+	sig, ok := f.Type().(*types2.Signature)
+	if !ok {
+		return false
+	}
+	results := sig.Results()
+	if results.Len() != 1 {
+		return false
+	}
+	_, isPtr := results.At(0).Type().Underlying().(*types2.Pointer)
+	return isPtr
+}
+
 // checkGolfBoundaryArg enforces GOLF's copy-at-boundary rule
 // (DESIGN.md §3.3): a pointer-typed argument passed across a call
 // that crosses between a gc-mode and a manual-mode file must be the
@@ -3017,13 +3062,8 @@ func checkGolfBoundaryArg(pw *pkgWriter, arg syntax.Expr) {
 
 	call, ok := syntax.Unparen(arg).(*syntax.CallExpr)
 	if ok {
-		if f, ok := calleeFunc(pw.info, call.Fun); ok {
-			if pkg := f.Pkg(); pkg != nil && pkg.Path() == "golf" {
-				switch f.Name() {
-				case "Copy", "Transfer":
-					return
-				}
-			}
+		if f, ok := calleeFunc(pw.info, call.Fun); ok && isGolfOwnershipFunc(f) {
+			return
 		}
 	}
 

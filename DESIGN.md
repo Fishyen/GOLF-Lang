@@ -99,12 +99,15 @@ func update() {
 }
 ```
 
+A single-result cross-mode call is checked the same way at the use site: a
+bare `p := MakePoint()` where `MakePoint` crosses modes is rejected unless
+written `p := golf.Copy(MakePoint())` (or `golf.Transfer(...)`).
+
 **Not yet done (named gaps, not solved by v1):**
-- Only direct pointer arguments at call sites are checked. Slices, and
-  struct fields that themselves hold pointers, cross boundaries unchecked
-  -- the same hazard noted in §3.5 for `golf.Alloc`.
-- Return values are not checked: a manual-mode function returning a
-  pointer to a GC-mode caller (or vice versa) is not yet caught.
+- Only direct pointer arguments and single-result pointer return values at
+  call sites are checked. Slices, struct fields that themselves hold
+  pointers, and multi-result functions (e.g. `func() (*T, *T)`) cross
+  boundaries unchecked -- the same hazard noted in §3.5 for `golf.Alloc`.
 - The check only looks at calls within the same package; crossing a
   package boundary into a differently-moded file in another package isn't
   detected.
