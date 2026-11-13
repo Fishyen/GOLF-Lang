@@ -2916,6 +2916,11 @@ func (c *declCollector) Visit(n syntax.Node) syntax.Visitor {
 			c.pw.errorf(n, "map type not allowed in manual-mode file (//golf:mem(manual)); see DESIGN.md")
 		}
 
+	case *syntax.InterfaceType:
+		if c.file.golfMode == "manual" {
+			c.pw.errorf(n, "interface type not allowed in manual-mode file (//golf:mem(manual)); see DESIGN.md")
+		}
+
 	case *syntax.FuncLit:
 		if scope := pw.info.Scopes[n.Type]; scope != nil {
 			copy := *c
@@ -2924,10 +2929,15 @@ func (c *declCollector) Visit(n syntax.Node) syntax.Visitor {
 		}
 
 	case *syntax.Name:
-		if c.file.golfMode == "manual" && c.closureScope != nil {
+		if c.file.golfMode == "manual" {
 			if obj, ok := pw.info.Uses[n]; ok {
-				if v, ok := obj.(*types2.Var); ok && !isGlobal(v) && !scopeContains(c.closureScope, v.Parent()) {
+				if v, ok := obj.(*types2.Var); ok && c.closureScope != nil && !isGlobal(v) && !scopeContains(c.closureScope, v.Parent()) {
 					pw.errorf(n, "closures may not capture variables in manual-mode file (//golf:mem(manual)); %s is declared outside this closure; see DESIGN.md", n.Value)
+				}
+				if tn, ok := obj.(*types2.TypeName); ok {
+					if _, ok := tn.Type().Underlying().(*types2.Interface); ok {
+						pw.errorf(n, "interface type %s not allowed in manual-mode file (//golf:mem(manual)); see DESIGN.md", n.Value)
+					}
 				}
 			}
 		}
