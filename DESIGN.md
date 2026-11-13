@@ -183,6 +183,67 @@ exactly matching §2's original investigation.
   `//golf:mem(gc|manual)` at file scope, with an equivalent inline
   form/annotation at the declaration/allocation site for the opt-out case.
 
+**Status: per-allocation opt-out implemented.** The modifier is a pragma
+comment immediately preceding a single `var` declaration (package-level or
+local): `//golf:collect` opts that declaration into GC mode, `//golf:manual`
+opts it into manual mode, and `//golf:real` is reserved for RSR (see §3.1) --
+parsed and validated now, but rejected with a clear "not implemented yet"
+error at every use, since RSR itself doesn't exist yet. There's no separate
+`//golf:mem(real)` third file-level mode to design around yet either; only
+the per-declaration spelling exists so far.
+
+```go
+//golf:mem(manual)
+package renderer
+
+//golf:collect
+var frameCache = map[string]int{} // GC-backed, despite the file default
+
+func init() {
+    frameCache["frames"] = 0 // fine: within the overridden declaration
+}
+```
+
+- The override is scoped to the declaration statement itself -- its type
+  and any inline initializer expression on the same `var` line -- not to
+  every later use of that variable throughout the file. A map/interface
+  literal built later in the file, even one assigned into the overridden
+  variable, is still checked against the *file's* mode, since checking is
+  syntactic (is this `map[...]`/`interface{...}` syntax node written in
+  manual-mode code), not a dataflow trace of which variable it eventually
+  flows into. In practice this means: build the GC-backed value (map
+  literal, interface value) at the declaration site -- inline or in an
+  immediately-following statement isn't covered, only the declaration's own
+  `Type`/`Values` subtree is -- then read/write through it (indexing,
+  method calls) freely elsewhere; constructing another one of the same
+  shape elsewhere in the file still needs its own `//golf:collect`
+  declaration.
+- A modifier naming the mode the declaration is already in (e.g.
+  `//golf:manual` in a file that's already `//golf:mem(manual)`) is a
+  compile error ("redundant"), not silently accepted -- same philosophy as
+  rejecting a duplicate `//golf:noreflect` method name (§2): a directive
+  that does nothing is more likely a mistake than an intentional no-op.
+- Implementation: `declCollector` (noder/writer.go) gained a
+  `varGolfMode` field threaded through `syntax.Walk`'s visitor-copy
+  mechanism exactly like `closureScope` already was for closure-capture
+  detection -- visiting a `*syntax.VarDecl` with a valid override returns a
+  modified copy of the visitor for that subtree, so every manual-mode
+  dialect check (`MapType`, `InterfaceType`, closure capture, interface
+  `Name` use) consults a new `c.golfMode()` helper (override-or-file-mode)
+  instead of reading `c.file.golfMode` directly. No change was needed to
+  §3.3's cross-mode boundary/copy checks, which key off a *function's*
+  declared mode, not a variable's -- a function-level override isn't part
+  of this feature.
+- Verified with the usual full `./make.bash` three-stage bootstrap, `go
+  test ./...` across `cmd/compile`, `go build std cmd`, `go vet std`, and a
+  stdlib spot-check, plus a hand-written positive/negative matrix: a
+  `//golf:collect` var in a manual-mode file builds and runs correctly
+  while an un-annotated sibling var of the same (otherwise-forbidden) type
+  in the same file still errors; `//golf:real` always errors;
+  `//golf:manual`/`//golf:collect` naming the file's current mode errors as
+  redundant; the directive misplaced anywhere but immediately before a
+  `var` declaration errors.
+
 ### 3.3 Cross-mode ownership: copy at the boundary
 
 When a value crosses from one mode's code into another's (e.g. a GC file

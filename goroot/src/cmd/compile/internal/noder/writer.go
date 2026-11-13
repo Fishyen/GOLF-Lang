@@ -2866,6 +2866,24 @@ type declCollector struct {
 	// or nil if not currently inside one. Used to detect variable
 	// capture for manual mode's closure restriction.
 	closureScope *types2.Scope
+
+	// varGolfMode is the //golf:collect/manual/real override mode in
+	// effect for the var declaration currently being visited ("gc",
+	// "manual", or "" if no override applies here), scoped to that
+	// declaration's type and initializer expressions. See golfMode
+	// and DESIGN.md §3.2.
+	varGolfMode string
+}
+
+// golfMode returns the effective golf memory-management mode for the
+// code currently being visited: a declaration-scoped //golf:collect
+// or //golf:manual override, if one is in effect, else the
+// containing file's //golf:mem mode.
+func (c *declCollector) golfMode() string {
+	if c.varGolfMode != "" {
+		return c.varGolfMode
+	}
+	return c.file.golfMode
 }
 
 func (c *declCollector) withTParams(obj types2.Object) *declCollector {
@@ -2936,11 +2954,23 @@ func (c *declCollector) Visit(n syntax.Node) syntax.Visitor {
 		return c.withTParams(obj)
 
 	case *syntax.VarDecl:
-		pw.checkPragmas(n.Pragma, 0, true)
+		pw.checkPragmasVarDecl(n.Pragma, 0, true)
 
 		if p, ok := n.Pragma.(*pragmas); ok && len(p.Embeds) > 0 {
 			if err := checkEmbed(n, c.file.importedEmbed, c.withinFunc); err != nil {
 				pw.errorf(p.Embeds[0].Pos, "%s", err)
+			}
+		}
+
+		if p, ok := n.Pragma.(*pragmas); ok && p.GolfVarMode != "" {
+			if p.GolfVarMode == "real" {
+				pw.errorf(p.GolfVarModePos, "//golf:real is reserved for RSR, not implemented yet; see DESIGN.md §3.1")
+			} else if p.GolfVarMode == c.golfMode() {
+				pw.errorf(p.GolfVarModePos, "redundant //golf:%s directive; this declaration is already in %s mode", map[string]string{"gc": "collect", "manual": "manual"}[p.GolfVarMode], p.GolfVarMode)
+			} else {
+				copy := *c
+				copy.varGolfMode = p.GolfVarMode
+				return &copy
 			}
 		}
 
@@ -2952,13 +2982,13 @@ func (c *declCollector) Visit(n syntax.Node) syntax.Visitor {
 		}
 
 	case *syntax.MapType:
-		if c.file.golfMode == "manual" {
-			c.pw.errorf(n, "map type not allowed in manual-mode file (//golf:mem(manual)); see DESIGN.md")
+		if c.golfMode() == "manual" {
+			c.pw.errorf(n, "map type not allowed in manual-mode code (//golf:mem(manual) or //golf:manual); see DESIGN.md")
 		}
 
 	case *syntax.InterfaceType:
-		if c.file.golfMode == "manual" {
-			c.pw.errorf(n, "interface type not allowed in manual-mode file (//golf:mem(manual)); see DESIGN.md")
+		if c.golfMode() == "manual" {
+			c.pw.errorf(n, "interface type not allowed in manual-mode code (//golf:mem(manual) or //golf:manual); see DESIGN.md")
 		}
 
 	case *syntax.FuncLit:
@@ -2969,14 +2999,14 @@ func (c *declCollector) Visit(n syntax.Node) syntax.Visitor {
 		}
 
 	case *syntax.Name:
-		if c.file.golfMode == "manual" {
+		if c.golfMode() == "manual" {
 			if obj, ok := pw.info.Uses[n]; ok {
 				if v, ok := obj.(*types2.Var); ok && c.closureScope != nil && !isGlobal(v) && !scopeContains(c.closureScope, v.Parent()) {
-					pw.errorf(n, "closures may not capture variables in manual-mode file (//golf:mem(manual)); %s is declared outside this closure; see DESIGN.md", n.Value)
+					pw.errorf(n, "closures may not capture variables in manual-mode code (//golf:mem(manual) or //golf:manual); %s is declared outside this closure; see DESIGN.md", n.Value)
 				}
 				if tn, ok := obj.(*types2.TypeName); ok {
 					if _, ok := tn.Type().Underlying().(*types2.Interface); ok {
-						pw.errorf(n, "interface type %s not allowed in manual-mode file (//golf:mem(manual)); see DESIGN.md", n.Value)
+						pw.errorf(n, "interface type %s not allowed in manual-mode code (//golf:mem(manual) or //golf:manual); see DESIGN.md", n.Value)
 					}
 				}
 			}
@@ -3344,11 +3374,12 @@ func (pw *pkgWriter) checkPragmas(p syntax.Pragma, allowed ir.PragmaFlag, embedO
 // checkPragmasGolfMem is checkPragmas, plus a fileLevel flag: a
 // //golf:mem directive is only valid when attached to the package
 // clause (the file-level pragma); anywhere else it is misplaced. It
-// also rejects //golf:noreflect here, since that one is only valid on
-// a type declaration -- callers on a type declaration use
-// checkPragmasTypeDecl instead, which skips this rejection.
+// also rejects //golf:noreflect and //golf:collect/manual/real here,
+// since those are only valid on a type declaration or var declaration
+// respectively -- callers on those use checkPragmasTypeDecl or
+// checkPragmasVarDecl instead, which skip the relevant rejection.
 func (pw *pkgWriter) checkPragmasGolfMem(p syntax.Pragma, allowed ir.PragmaFlag, embedOK bool, fileLevel bool) {
-	pw.checkPragmasGolf(p, allowed, embedOK, fileLevel, false)
+	pw.checkPragmasGolf(p, allowed, embedOK, fileLevel, false, false)
 }
 
 // checkPragmasTypeDecl is checkPragmas for a type declaration: like
@@ -3357,10 +3388,19 @@ func (pw *pkgWriter) checkPragmasGolfMem(p syntax.Pragma, allowed ir.PragmaFlag,
 // *syntax.TypeDecl case in declCollector.Visit validates separately
 // once types2 info for the declared type is available.
 func (pw *pkgWriter) checkPragmasTypeDecl(p syntax.Pragma, allowed ir.PragmaFlag, embedOK bool) {
-	pw.checkPragmasGolf(p, allowed, embedOK, false, true)
+	pw.checkPragmasGolf(p, allowed, embedOK, false, true, false)
 }
 
-func (pw *pkgWriter) checkPragmasGolf(p syntax.Pragma, allowed ir.PragmaFlag, embedOK bool, fileLevel, typeDecl bool) {
+// checkPragmasVarDecl is checkPragmas for a var declaration: like
+// checkPragmasGolfMem with fileLevel false, except it allows (and
+// doesn't itself validate) a //golf:collect, //golf:manual, or
+// //golf:real directive, which the *syntax.VarDecl case in
+// declCollector.Visit validates separately. See DESIGN.md §3.2.
+func (pw *pkgWriter) checkPragmasVarDecl(p syntax.Pragma, allowed ir.PragmaFlag, embedOK bool) {
+	pw.checkPragmasGolf(p, allowed, embedOK, false, false, true)
+}
+
+func (pw *pkgWriter) checkPragmasGolf(p syntax.Pragma, allowed ir.PragmaFlag, embedOK bool, fileLevel, typeDecl, varDecl bool) {
 	if p == nil {
 		return
 	}
@@ -3383,6 +3423,9 @@ func (pw *pkgWriter) checkPragmasGolf(p syntax.Pragma, allowed ir.PragmaFlag, em
 	}
 	if len(pragma.GolfNoReflect) > 0 && !typeDecl {
 		pw.errorf(pragma.GolfNoReflectPos, "misplaced //golf:noreflect directive; must precede a type declaration")
+	}
+	if pragma.GolfVarMode != "" && !varDecl {
+		pw.errorf(pragma.GolfVarModePos, "misplaced //golf:collect, //golf:manual, or //golf:real directive; must precede a var declaration")
 	}
 }
 
