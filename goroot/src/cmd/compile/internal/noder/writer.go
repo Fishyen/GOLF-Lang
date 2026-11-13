@@ -2822,6 +2822,11 @@ type declCollector struct {
 	file       *fileImports
 	withinFunc bool
 	implicits  []*types2.TypeParam
+
+	// closureScope is the innermost enclosing function literal's scope,
+	// or nil if not currently inside one. Used to detect variable
+	// capture for manual mode's closure restriction.
+	closureScope *types2.Scope
 }
 
 func (c *declCollector) withTParams(obj types2.Object) *declCollector {
@@ -2910,9 +2915,38 @@ func (c *declCollector) Visit(n syntax.Node) syntax.Visitor {
 		if c.file.golfMode == "manual" {
 			c.pw.errorf(n, "map type not allowed in manual-mode file (//golf:mem(manual)); see DESIGN.md")
 		}
+
+	case *syntax.FuncLit:
+		if scope := pw.info.Scopes[n.Type]; scope != nil {
+			copy := *c
+			copy.closureScope = scope
+			return &copy
+		}
+
+	case *syntax.Name:
+		if c.file.golfMode == "manual" && c.closureScope != nil {
+			if obj, ok := pw.info.Uses[n]; ok {
+				if v, ok := obj.(*types2.Var); ok && !isGlobal(v) && !scopeContains(c.closureScope, v.Parent()) {
+					pw.errorf(n, "closures may not capture variables in manual-mode file (//golf:mem(manual)); %s is declared outside this closure; see DESIGN.md", n.Value)
+				}
+			}
+		}
 	}
 
 	return c
+}
+
+// scopeContains reports whether ancestor is s itself or one of s's
+// enclosing scopes, i.e. whether walking s's Parent chain reaches
+// ancestor.
+func scopeContains(ancestor, s *types2.Scope) bool {
+	for s != nil {
+		if s == ancestor {
+			return true
+		}
+		s = s.Parent()
+	}
+	return false
 }
 
 func (pw *pkgWriter) collectDecls(noders []*noder) {
