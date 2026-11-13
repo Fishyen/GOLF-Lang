@@ -129,19 +129,46 @@ list's `Node{Next *Node}`) classify fine and don't risk infinite
 recursion, since the check never follows a pointer into its pointee, only
 drills into a struct's or array's *own* fields/elements.
 
-**Not yet done (named gaps, not solved by v1):**
+**Status update:** the check now also covers calls into *imported*
+packages, not just within the same package. A function's `//golf:mem`
+mode is written into the public per-object record every exported
+function/method already carries in GOLF's compiled export data (right
+after its declaration position, before `funcExt`'s private extension
+data) -- the same record a `go/types2`-style importer decodes to
+reconstruct an imported package's types for the importing package's own
+type-checking. `cmd/compile/internal/testimporter` (GOLF's `go/types2`
+importer) reads it back and exposes it via `testimporter.FuncMode(f)`,
+keyed by the `*types2.Func` it constructs for each imported function;
+`calleeGolfMode` in writer.go checks `pkgWriter.funcGolfMode` (current
+package) first and falls back to `testimporter.FuncMode` (imported
+package) transparently, so every check already built on top of it --
+arguments, returns, slices, structs -- now works across a package
+boundary exactly the same way it does within one.
+
+This touches the one piece of shared, high-blast-radius machinery in this
+whole feature: the per-object record format that *every* exported
+declaration in *every* package goes through, decoded by two independent
+readers (`noder/reader.go` for re-reading a package's own declarations,
+`testimporter/ureader.go` for importing another package's). Both were
+updated to consume the new field in lockstep with the writer. Verified
+with: a full `./make.bash` three-stage bootstrap (the compiler compiling
+itself with the new format, at every stage); `go test` across the whole
+of `cmd/compile/...` (every subpackage, no failures); `go build std cmd`
+and `go vet std` (clean); `go test` on `reflect`, `go/types`,
+`go/importer`, plus the usual encoding/json, net/http, errors, fmt
+spot-check (all ok); and a hand-built two-package example (a separately
+`go build`-compiled `manual`-mode `renderer` package imported by a
+`gc`-mode `main`) confirming a bare cross-package pointer argument and
+return are both now rejected, wrapping them in `golf.Copy`/`Transfer`
+fixes it, and an unrelated same-mode cross-package call is unaffected.
+
+**Not yet done (named gap, not solved by v1):**
 - Map- and interface-typed fields inside a crossing struct aren't
   detected or deep-copied. The main case this would matter for -- a
   manual-mode-declared struct smuggling one across -- can't arise, since
   manual-mode files can't declare map or interface types at all (§3.4);
   what's left unchecked is a GC-mode struct's map/interface field
   crossing into manual code.
-- The check only looks at calls within the same package. Detecting a
-  crossing into another package's differently-moded file would need that
-  file's `//golf:mem` mode to be recorded in the package's export data (it
-  currently exists only in this package's own in-memory compile state,
-  `pkgWriter.funcGolfMode`) -- a real but separate piece of work, not
-  attempted here.
 - `golf.Alloc`/`golf.Free` are still not gated to manual-mode files (see
   §3.5) -- this was a deliberate decision to preserve interoperability,
   not an oversight. `golf.Copy`/`golf.Transfer` are plain generic functions

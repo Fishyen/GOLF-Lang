@@ -7,6 +7,7 @@ package testimporter
 import (
 	"cmp"
 	"slices"
+	"sync"
 
 	"cmd/compile/internal/base"
 	"cmd/compile/internal/syntax"
@@ -14,6 +15,28 @@ import (
 	"cmd/internal/src"
 	"internal/pkgbits"
 )
+
+// golfFuncMode records the //golf:mem mode of the file each imported
+// package-level function (or ordinary method) was declared in, keyed
+// by the *types2.Func this reader constructs for it. Populated in
+// objIdx's pkgbits.ObjFunc case below; read via FuncMode. See
+// DESIGN.md §3.3's cross-package copy-at-boundary gap.
+var golfFuncMode sync.Map // map[*types2.Func]string
+
+// FuncMode returns the //golf:mem mode ("gc" or "manual") of the file
+// f was declared in, if f was imported through this reader and that
+// mode was recorded for it. ok is false for anything else (a function
+// from a package compiled before this field existed, a method
+// reached through the generic-receiver path, which isn't covered
+// yet, etc.) -- callers should treat that the same as "unknown,
+// don't enforce," not as "gc mode."
+func FuncMode(f *types2.Func) (mode string, ok bool) {
+	v, found := golfFuncMode.Load(f)
+	if !found {
+		return "", false
+	}
+	return v.(string), true
+}
 
 type pkgReader struct {
 	pkgbits.PkgDecoder
@@ -467,7 +490,13 @@ func (pr *pkgReader) objIdx(idx pkgbits.Index) (*types2.Package, string) {
 			}
 			tparams := r.typeParamNames(false, false)
 			sig := r.signature(nil, nil, tparams)
-			return types2.NewFunc(pos, objPkg, objName, sig)
+			_ = r.pos()            // decl pos (writer's w.pos(decl)); not needed here
+			golfMode := r.String() // golf: declaring-file //golf:mem mode; see golfFuncMode
+			fn := types2.NewFunc(pos, objPkg, objName, sig)
+			if golfMode != "" {
+				golfFuncMode.Store(fn, golfMode)
+			}
+			return fn
 
 		case pkgbits.ObjType:
 			pos := r.pos()

@@ -19,6 +19,7 @@ import (
 	"cmd/compile/internal/base"
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/syntax"
+	"cmd/compile/internal/testimporter"
 	"cmd/compile/internal/types"
 	"cmd/compile/internal/types2"
 )
@@ -908,6 +909,13 @@ func (w *writer) doObj(wext *writer, obj types2.Object) pkgbits.CodeObj {
 		w.typeParamNames(sig.TypeParams())
 		w.signature(sig)
 		w.pos(decl)
+		// golf: write this function's declaring-file //golf:mem mode
+		// into the public object record (not funcExt's RelocObjExt,
+		// which only cmd/compile's own reader -- not a go/types2
+		// importer like testimporter -- decodes) so that an importing
+		// package can see it too. See DESIGN.md §3.3's cross-package
+		// gap and testimporter.FuncGolfMode.
+		w.String(w.p.funcGolfMode[obj])
 		wext.funcExt(obj)
 		return pkgbits.ObjFunc
 
@@ -2964,7 +2972,7 @@ func (c *declCollector) Visit(n syntax.Node) syntax.Visitor {
 					pw.golfReturnExempt[inner] = true
 				}
 			}
-			if calleeMode, ok := pw.funcGolfMode[callee]; ok && calleeMode != c.file.golfMode {
+			if calleeMode, ok := calleeGolfMode(pw, callee); ok && calleeMode != c.file.golfMode {
 				for _, arg := range n.ArgList {
 					checkGolfBoundaryArg(pw, arg)
 				}
@@ -2974,6 +2982,21 @@ func (c *declCollector) Visit(n syntax.Node) syntax.Visitor {
 	}
 
 	return c
+}
+
+// calleeGolfMode returns the //golf:mem mode of the file callee was
+// declared in: from pw.funcGolfMode if callee belongs to the package
+// currently being compiled, or otherwise from testimporter.FuncMode,
+// which the same information was written into (as part of each
+// function's public object record, not funcExt) so that an importing
+// package can see it too. ok is false if callee's declaring file's
+// mode isn't known at all (including e.g. a method reached through
+// the generic-receiver path, which neither source records).
+func calleeGolfMode(pw *pkgWriter, callee *types2.Func) (string, bool) {
+	if mode, ok := pw.funcGolfMode[callee]; ok {
+		return mode, true
+	}
+	return testimporter.FuncMode(callee)
 }
 
 // collectFuncGolfModes populates pw.funcGolfMode for every

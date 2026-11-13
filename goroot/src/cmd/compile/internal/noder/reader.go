@@ -811,6 +811,7 @@ func (pr *pkgReader) objIdxMayFail(idx index, implicits, explicits []*types.Type
 		r.typeParamNames()
 		typ := r.signature(recv)
 		fpos := r.pos()
+		_ = r.String() // golf mode; not needed when re-reading the local package's own objects
 
 		fn := ir.NewFunc(fpos, npos, sym, typ)
 		if r.hasTypeParams() && r.dict.shaped {
