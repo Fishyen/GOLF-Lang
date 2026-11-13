@@ -527,5 +527,170 @@ isn't designed).
 - How selective linking's reachability analysis interacts with per-file
   memory-mode metadata.
 - RSR design itself (explicitly deferred past v1).
-- The rest of the QOL/general-optimization feature list — not yet
-  enumerated beyond "general optimizations" and "QOL additions."
+- The rest of the QOL/general-optimization feature list beyond §5's
+  try/catch/success -- not yet enumerated beyond the candidate list in §5.
+
+## 5. QOL features (Go community requests)
+
+Candidate list, roughly ordered by implementation size, of commonly-
+requested Go ergonomics improvements that fit GOLF's "keep Go's ergonomics
+as the default experience" goal (§1) without turning into a different
+language in the common case. Not all of these are committed; each gets
+its own scoping pass before implementation, same as everything else in
+this document.
+
+1. **Error-propagation sugar** (`try`/`catch`/`success`) -- **done**, see
+   below.
+2. `??` nil-coalescing for pointers/interfaces.
+3. Compile-time `implements` assertion sugar, replacing the
+   `var _ I = (*T)(nil)` idiom.
+4. Opt-in exhaustive-switch checking over a closed set of consts.
+5. Operator overloading for user-defined numeric/vector types, bounded to
+   a fixed set of method names (not general operator overloading) --
+   particularly relevant given GOLF's game-dev focus.
+6. String interpolation, desugaring into `fmt.Sprintf`.
+7. Named/default function parameters.
+8. `const` aggregate literals (const arrays/structs, not just scalars).
+9. First-class sum types / tagged unions -- the single most-requested Go
+   *language* feature, but the largest item here by far (new type kind,
+   exhaustiveness checking, pattern matching); a separate design pass of
+   its own before any code, same as RSR.
+10. Lightweight pattern matching / destructuring beyond today's type
+    switch.
+
+### 5.1 Error-propagation sugar: `try` / `catch` / `success`
+
+**Status: implemented.** `try`/`catch`/`success` are new contextual
+(soft) keywords -- not reserved words, since "try", "catch", and
+"success" are all common, completely ordinary Go identifiers (GOLF's own
+standard library build confirmed this: `os` has a `success()` method,
+several packages use `try` as a local variable or test-helper name, "the
+catch" appears in comments). They're special only in the same narrow,
+unambiguous sense §3.2's `collect`/`manual`/`real` modifiers are: `try`
+is recognized only when immediately followed by `{` with nothing between
+them (never arising from legal Go source otherwise -- a bare `try{}`
+composite-literal statement naming a type called `try` is the only
+theoretical collision, and it doesn't appear anywhere in GOLF's own
+stdlib); `catch`/`success` are recognized only immediately after a
+`try`-block's closing `}` with no intervening newline, the same
+"cuddled brace" requirement stock Go already imposes on `} else {`,
+just for soft keywords instead of a reserved one.
+
+```go
+try {
+    a, err := step1()
+    b, err := step2(a)
+} catch err {
+    log.Println("failed:", err)
+} success {
+    use(a, b)
+}
+```
+
+- **Checkpoints:** inside the `try` block, any top-level assignment or
+  short variable declaration whose *last* left-hand-side name is
+  literally `err` is a checkpoint -- if that statement leaves `err`
+  non-nil, control jumps to the `catch` block. This is a naming
+  convention, not a type-driven check (matches the established Go idiom
+  of naming the error result `err`, and needs no type information at
+  parse time, keeping the whole feature a pure syntax-to-syntax
+  desugaring -- see below). A statement whose last name isn't `err` is
+  left completely alone, and a bare call-expression statement (no
+  left-hand side to name) is never auto-checked, same as outside a try
+  block -- discarding an error is always an explicit choice. A `try`
+  block with zero checkpoints is legal (if unusual): the try and success
+  bodies just run unconditionally in sequence, and the compiler omits
+  the unreachable catch machinery entirely rather than emit an
+  unused-label/unused-variable error.
+- **`catch <name> { ... }`** is required, and rebinds the propagated
+  error under whatever name the programmer chooses -- it doesn't have to
+  match the `err` convention used inside the try block. Known v1
+  limitation: the catch block only ever sees the propagated error
+  itself, not any partial results from before the failure (the variables
+  the try block declared are out of scope there) -- document this,
+  rationale below.
+- **`success { ... }`** is optional, and runs only if every checkpoint
+  passed. Every variable the try block declared *is* in scope here,
+  since it's desugared as the literal tail of the same block the try
+  statements run in (see below) -- this is the main reason `catch` and
+  `success` have asymmetric visibility: extending it to `catch` as well
+  would mean the catch label needs to be reachable from a jump that
+  skips over those same declarations, which Go's goto-scope rule
+  forbids without either variable hoisting (impossible without type
+  information -- the whole point of keeping this purely syntactic) or
+  duplicating the catch body once per checkpoint (code bloat, and a
+  correctness hazard if a cloned subtree were ever accidentally shared
+  rather than independently copied). Limiting catch to the error alone
+  sidesteps all of that cleanly.
+- **`return`, `break`, and `continue` inside `catch` or `success` behave
+  exactly as if they'd been written directly in the enclosing function or
+  loop** -- `try` is not a closure. This was a deliberate design
+  decision, not a side effect: an earlier design considered wrapping the
+  whole construct in an immediately-invoked closure (which would have
+  avoided some of the scoping work below), but that would have silently
+  changed what `return` means inside a catch block, which defeats most
+  of the point -- `return err` is by far the most common thing anyone
+  will want to write there, replacing exactly the
+  `if err != nil { return err }` idiom this feature exists to shorten.
+- **Implementation, pure syntax-to-syntax desugaring:** entirely
+  contained in `cmd/compile/internal/syntax` (parser.go's `golfTryStmt`,
+  wired into `stmtOrNil` the same way `golfVarModOrNil` is) -- no changes
+  anywhere else (types2, noder, the backend), since the desugared output
+  is built entirely from ordinary `goto`/label/block/var constructs those
+  packages already handle for any hand-written Go using them. Given
+  ```go
+  try { S1; S2 } catch err { C } success { Z }
+  ```
+  with `S1` a checkpoint and `S2` not, it becomes (synthesized names
+  elided for clarity):
+  ```go
+  var _err error
+  {
+      S1
+      if err != nil {
+          _err = err
+          goto _catch
+      }
+      S2
+      Z
+  }
+  goto _done
+  _catch:
+  {
+      err := _err   // rebound under catch's own chosen name
+      C
+  }
+  _done:
+  ```
+  The hoisted `_err`, declared *before* the inner block (so it's already
+  in scope at every `goto` site inside it), is what lets the single
+  physical copy of `C` reach every checkpoint without either duplicating
+  it or needing a jump to skip into the inner block's own scope -- every
+  `goto` here only ever jumps *out* of a block, never into one, which is
+  what keeps this legal under Go's "a goto must not cause a variable to
+  come into scope that wasn't already in scope at the goto" rule. The
+  parser's own `checkBranches` pass (already run automatically at the
+  end of every function body) validates the generated `goto`s exactly as
+  if a programmer had written them by hand, which caught the two real
+  bugs found during development (below) immediately, as ordinary compile
+  errors against the generated code -- not something this feature had to
+  reimplement.
+- **Verified** with a full three-stage `./make.bash` bootstrap, `go test
+  ./...` across `cmd/compile` (`syntax` included), `go build`/`vet std
+  cmd`, and a hand-written matrix: success-only and catch-triggering
+  cases; a zero-checkpoint try block; variables declared in the try body
+  visible in `success`; `return`/`continue` from inside `catch` reaching
+  the real enclosing function/loop (including from inside a `for` loop,
+  confirming the loop's own iteration continues normally); and
+  `try`/`catch`/`success` still working as ordinary identifiers,
+  function names, and struct field values everywhere else.
+- **Bugs found during development:** the DWARF scope-tracking pass
+  crashed with "unknown scope position" the first time this ran, because
+  the synthesized `*syntax.BlockStmt` nodes never had their `Rbrace`
+  position set (only a real `}` token sets it during normal parsing) --
+  fixed by giving each one a sensible position. The zero-checkpoint case
+  initially always emitted the catch/goto/label scaffolding regardless,
+  which correctly failed to compile with "label ... defined and not
+  used" once there was truly no checkpoint to reach it from -- fixed by
+  detecting that case up front and falling back to a plain inlined block
+  with no synthesized control flow at all.

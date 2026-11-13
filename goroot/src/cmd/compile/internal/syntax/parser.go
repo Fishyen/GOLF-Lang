@@ -33,6 +33,11 @@ type parser struct {
 	fnest  int    // function nesting level (for error handling)
 	xnest  int    // expression nesting level (for complit ambiguity resolution)
 	indent []byte // tracing support
+
+	// golfTryID generates unique synthesized identifiers for each
+	// try/catch/success statement's desugaring within this file. See
+	// golfTryStmt.
+	golfTryID int
 }
 
 func (p *parser) init(file *PosBase, r io.Reader, errh ErrorHandler, pragh PragmaHandler, mode Mode) {
@@ -861,6 +866,247 @@ func (p *parser) golfVarModOrNil() (mode string, pos Pos, name *Name) {
 		return mode, pos, nil
 	}
 	return "", pos, NewName(pos, lit)
+}
+
+// resumeNameStmt resumes ordinary statement parsing given an
+// already-consumed identifier name (from golfVarModOrNil or
+// golfTryOrNil determining it wasn't, after all, one of golf's
+// contextual keywords), continuing exactly where generic parsing
+// would have been had the identifier never been special-cased.
+func (p *parser) resumeNameStmt(name *Name) Stmt {
+	x := p.exprListFrom(p.pexpr(name, false))
+	if label, ok := x.(*Name); ok && p.tok == _Colon {
+		return p.labeledStmtOrNil(label)
+	}
+	return p.simpleStmt(x, 0)
+}
+
+// golfTryOrNil checks whether the parser is positioned at the
+// contextual keyword "try" immediately followed by "{" -- the only
+// context "try" is ever special in, for exactly the same reason
+// golfVarModOrNil's two-token check needs no lookahead buffer (see its
+// doc comment): a bare identifier "try" followed by a newline would
+// already get an automatically inserted semicolon, so "try" directly
+// followed by the token "{" with nothing between them on the same
+// line could otherwise only be the start of a composite literal
+// statement naming a type called "try" -- vanishingly rare, and never
+// found anywhere in GOLF's own standard library. See DESIGN.md's QOL
+// section.
+//
+// ok reports whether it matched (in which case "try" has already been
+// consumed and p.tok == _Lbrace, ready for p.blockStmt). If it didn't
+// match, name carries the already-consumed identifier (nil if the
+// current token wasn't even "try") for the caller to resume via
+// resumeNameStmt.
+func (p *parser) golfTryOrNil() (pos Pos, ok bool, name *Name) {
+	pos = p.pos()
+	if p.lit != "try" {
+		return pos, false, nil
+	}
+	lit := p.lit
+	p.next()
+	if p.tok == _Lbrace {
+		return pos, true, nil
+	}
+	return pos, false, NewName(pos, lit)
+}
+
+// golfTryStmt parses and desugars a try/catch/success statement:
+//
+//	TryStmt = "try" Block "catch" identifier Block [ "success" Block ] .
+//
+// Inside the try block, any top-level assignment or short variable
+// declaration whose last left-hand-side name is literally "err" (the
+// established Go convention for an error value, not a type-driven
+// check -- see DESIGN.md) is treated as a checkpoint: if that
+// statement leaves "err" non-nil, execution jumps to the catch block,
+// which rebinds the propagated error under whatever name the
+// programmer wrote in "catch <name> { ... }". If every checkpoint
+// passes, the success block (if present) runs, with every variable
+// the try block declared still in scope -- it's placed as the literal
+// tail of the same block. The catch block does not share that scope
+// (document as a known v1 limitation): it only ever sees the
+// propagated error itself, never partial results from before the
+// failure.
+//
+// This is desugared entirely into plain goto/label/block/var
+// constructs cmd/compile already understands end to end -- nothing
+// downstream of the parser (types2, noder, the backend) needs to know
+// this feature exists, and the parser's own checkBranches pass (run
+// automatically at the end of every function body) validates the
+// generated gotos exactly as if a programmer had written them by
+// hand.
+func (p *parser) golfTryStmt(pos Pos) Stmt {
+	if trace {
+		defer p.trace("golfTryStmt")()
+	}
+
+	tryBody := p.blockStmt("try clause")
+
+	if !(p.tok == _Name && p.lit == "catch") {
+		p.syntaxError("try must be followed directly by catch")
+		return tryBody
+	}
+	p.next() // "catch"
+	catchVar := p.name()
+	catchBody := p.blockStmt("catch clause")
+
+	var successBody *BlockStmt
+	if p.tok == _Name && p.lit == "success" {
+		p.next()
+		successBody = p.blockStmt("success clause")
+	}
+
+	id := p.golfTryID
+	p.golfTryID++
+	errVar := fmt.Sprintf("_golf_try_err%d", id)
+	catchLabel := fmt.Sprintf("_golf_try_catch%d", id)
+	doneLabel := fmt.Sprintf("_golf_try_done%d", id)
+
+	errDecl := new(VarDecl)
+	errDecl.pos = pos
+	errDecl.NameList = []*Name{NewName(pos, errVar)}
+	errDecl.Type = NewName(pos, "error")
+	errDeclStmt := new(DeclStmt)
+	errDeclStmt.pos = pos
+	errDeclStmt.DeclList = []Decl{errDecl}
+
+	hasCheckpoint := false
+	for _, s := range tryBody.List {
+		if golfTryErrName(s) != "" {
+			hasCheckpoint = true
+			break
+		}
+	}
+	if !hasCheckpoint {
+		// No statement in the try block is checked at all, so the
+		// catch path can never be reached -- emit it, the propagated-
+		// error var, and the goto/label plumbing to go with it, and
+		// an unused-label/unused-variable compile error would result.
+		// Just inline the try and success bodies directly.
+		simple := new(BlockStmt)
+		simple.pos = pos
+		simple.List = append(append([]Stmt{}, tryBody.List...), successList(successBody)...)
+		if successBody != nil {
+			simple.Rbrace = successBody.Rbrace
+		} else {
+			simple.Rbrace = tryBody.Rbrace
+		}
+		return simple
+	}
+
+	inner := make([]Stmt, 0, len(tryBody.List)+1)
+	for _, s := range tryBody.List {
+		inner = append(inner, s)
+		if name := golfTryErrName(s); name != "" {
+			checkPos := s.Pos()
+
+			cond := new(Operation)
+			cond.pos = checkPos
+			cond.Op = Neq
+			cond.X = NewName(checkPos, name)
+			cond.Y = NewName(checkPos, "nil")
+
+			propagate := new(AssignStmt)
+			propagate.pos = checkPos
+			propagate.Lhs = NewName(checkPos, errVar)
+			propagate.Rhs = NewName(checkPos, name)
+
+			branch := new(BranchStmt)
+			branch.pos = checkPos
+			branch.Tok = _Goto
+			branch.Label = NewName(checkPos, catchLabel)
+
+			then := new(BlockStmt)
+			then.pos = checkPos
+			then.List = []Stmt{propagate, branch}
+			then.Rbrace = checkPos
+
+			check := new(IfStmt)
+			check.pos = checkPos
+			check.Cond = cond
+			check.Then = then
+
+			inner = append(inner, check)
+		}
+	}
+	if successBody != nil {
+		inner = append(inner, successBody.List...)
+	}
+	innerBlock := new(BlockStmt)
+	innerBlock.pos = pos
+	innerBlock.List = inner
+	innerBlock.Rbrace = pos
+
+	skipCatch := new(BranchStmt)
+	skipCatch.pos = pos
+	skipCatch.Tok = _Goto
+	skipCatch.Label = NewName(pos, doneLabel)
+
+	catchBind := new(AssignStmt)
+	catchBind.pos = catchVar.Pos()
+	catchBind.Op = Def
+	catchBind.Lhs = catchVar
+	catchBind.Rhs = NewName(catchVar.Pos(), errVar)
+
+	catchBlock := new(BlockStmt)
+	catchBlock.pos = catchVar.Pos()
+	catchBlock.List = append([]Stmt{catchBind}, catchBody.List...)
+	catchBlock.Rbrace = catchBody.Rbrace
+
+	catchLabeled := new(LabeledStmt)
+	catchLabeled.pos = catchVar.Pos()
+	catchLabeled.Label = NewName(catchVar.Pos(), catchLabel)
+	catchLabeled.Stmt = catchBlock
+
+	doneEmpty := new(EmptyStmt)
+	doneEmpty.pos = pos
+	doneLabeled := new(LabeledStmt)
+	doneLabeled.pos = pos
+	doneLabeled.Label = NewName(pos, doneLabel)
+	doneLabeled.Stmt = doneEmpty
+
+	outer := new(BlockStmt)
+	outer.pos = pos
+	outer.List = []Stmt{errDeclStmt, innerBlock, skipCatch, catchLabeled, doneLabeled}
+	if successBody != nil {
+		outer.Rbrace = successBody.Rbrace
+	} else {
+		outer.Rbrace = catchBody.Rbrace
+	}
+	return outer
+}
+
+// successList returns b's statement list, or nil if b is nil (no
+// success clause was written).
+func successList(b *BlockStmt) []Stmt {
+	if b == nil {
+		return nil
+	}
+	return b.List
+}
+
+// golfTryErrName reports the checkpoint variable name for a try-block
+// statement -- "err" if s is a plain assignment or short variable
+// declaration whose last left-hand-side name is literally "err", or
+// "" if s isn't one of golf's try-block checkpoints at all. See
+// golfTryStmt.
+func golfTryErrName(s Stmt) string {
+	a, ok := s.(*AssignStmt)
+	if !ok || a.Rhs == nil || (a.Op != 0 && a.Op != Def) {
+		return ""
+	}
+	last := a.Lhs
+	if list, ok := a.Lhs.(*ListExpr); ok {
+		if len(list.ElemList) == 0 {
+			return ""
+		}
+		last = list.ElemList[len(list.ElemList)-1]
+	}
+	if name, ok := last.(*Name); ok && name.Value == "err" {
+		return "err"
+	}
+	return ""
 }
 
 // exprListFrom is exprList, but for when the first operand x has
@@ -2707,11 +2953,12 @@ func (p *parser) stmtOrNil() Stmt {
 			})
 			return s
 		} else if name != nil {
-			x := p.exprListFrom(p.pexpr(name, false))
-			if label, ok := x.(*Name); ok && p.tok == _Colon {
-				return p.labeledStmtOrNil(label)
-			}
-			return p.simpleStmt(x, 0)
+			return p.resumeNameStmt(name)
+		}
+		if pos, ok, name := p.golfTryOrNil(); ok {
+			return p.golfTryStmt(pos)
+		} else if name != nil {
+			return p.resumeNameStmt(name)
 		}
 		lhs := p.exprList()
 		if label, ok := lhs.(*Name); ok && p.tok == _Colon {
