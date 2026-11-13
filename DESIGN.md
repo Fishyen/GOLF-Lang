@@ -103,14 +103,27 @@ A single-result cross-mode call is checked the same way at the use site: a
 bare `p := MakePoint()` where `MakePoint` crosses modes is rejected unless
 written `p := golf.Copy(MakePoint())` (or `golf.Transfer(...)`).
 
+**Status update:** slices are now checked the same way as pointers, via
+`golf.CopySlice[T]`/`golf.TransferSlice[T]` (same package, same
+copy-by-default/opt-in-transfer shape) -- a slice argument or single-result
+slice return crossing a mode boundary must be wrapped just like a pointer
+would be. A cross-mode call with more than one result, where any result is
+a pointer or a slice, is now a hard compile error (`golf.Copy`/`Transfer`
+only take one value, so there is no syntax yet to make a multi-result
+crossing explicit) rather than a silent gap -- it must be restructured
+into single-result calls to cross the boundary at all.
+
 **Not yet done (named gaps, not solved by v1):**
-- Only direct pointer arguments and single-result pointer return values at
-  call sites are checked. Slices, struct fields that themselves hold
-  pointers, and multi-result functions (e.g. `func() (*T, *T)`) cross
-  boundaries unchecked -- the same hazard noted in §3.5 for `golf.Alloc`.
-- The check only looks at calls within the same package; crossing a
-  package boundary into a differently-moded file in another package isn't
-  detected.
+- Struct fields that themselves hold a pointer or slice still cross
+  boundaries unchecked when the struct itself is passed by value -- the
+  same hazard noted in §3.5 for `golf.Alloc`. Catching this needs walking
+  into field types recursively, which hasn't been done yet.
+- The check only looks at calls within the same package. Detecting a
+  crossing into another package's differently-moded file would need that
+  file's `//golf:mem` mode to be recorded in the package's export data (it
+  currently exists only in this package's own in-memory compile state,
+  `pkgWriter.funcGolfMode`) -- a real but separate piece of work, not
+  attempted here.
 - `golf.Alloc`/`golf.Free` are still not gated to manual-mode files (see
   §3.5) -- this was a deliberate decision to preserve interoperability,
   not an oversight. `golf.Copy`/`golf.Transfer` are plain generic functions

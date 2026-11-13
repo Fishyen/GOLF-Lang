@@ -2959,7 +2959,7 @@ func (c *declCollector) Visit(n syntax.Node) syntax.Visitor {
 
 	case *syntax.CallExpr:
 		if callee, ok := calleeFunc(pw.info, n.Fun); ok {
-			if isGolfOwnershipFunc(callee) && len(n.ArgList) == 1 {
+			if isAnyGolfWrapper(callee) && len(n.ArgList) == 1 {
 				if inner, ok := syntax.Unparen(n.ArgList[0]).(*syntax.CallExpr); ok {
 					pw.golfReturnExempt[inner] = true
 				}
@@ -2968,9 +2968,7 @@ func (c *declCollector) Visit(n syntax.Node) syntax.Visitor {
 				for _, arg := range n.ArgList {
 					checkGolfBoundaryArg(pw, arg)
 				}
-				if !pw.golfReturnExempt[n] && calleeSinglePointerResult(callee) {
-					pw.errorf(n, "implicit cross-mode pointer return value not allowed; wrap the call in golf.Copy(...) or golf.Transfer(...) to make ownership explicit; see DESIGN.md §3.3")
-				}
+				checkGolfBoundaryResult(pw, n, callee)
 			}
 		}
 	}
@@ -3016,58 +3014,139 @@ func calleeFunc(info *types2.Info, fun syntax.Expr) (*types2.Func, bool) {
 	return f, ok
 }
 
-// isGolfOwnershipFunc reports whether f is golf.Copy or golf.Transfer,
-// GOLF's explicit cross-mode ownership primitives (DESIGN.md §3.3).
-func isGolfOwnershipFunc(f *types2.Func) bool {
+// golfBoundaryKind classifies a type for GOLF's copy-at-boundary check
+// (DESIGN.md §3.3): "ptr" for pointer types, "slice" for slice types
+// (both hold an implicit reference that the copy-at-boundary rule
+// cares about), or "" for anything else (e.g. scalars, arrays,
+// structs with no indirection -- Go's by-value call semantics already
+// make those safe to pass across a mode boundary; see DESIGN.md's
+// named gap for structs that themselves contain pointer fields).
+func golfBoundaryKind(t types2.Type) string {
+	if t == nil {
+		return ""
+	}
+	switch t.Underlying().(type) {
+	case *types2.Pointer:
+		return "ptr"
+	case *types2.Slice:
+		return "slice"
+	}
+	return ""
+}
+
+// golfWrapperNames returns the golf package function names that make
+// crossing a boundary with a value of the given golfBoundaryKind
+// explicit: the copy-by-default primitive and the transfer escape
+// hatch, respectively.
+func golfWrapperNames(kind string) (copyName, transferName string) {
+	switch kind {
+	case "ptr":
+		return "Copy", "Transfer"
+	case "slice":
+		return "CopySlice", "TransferSlice"
+	}
+	return "", ""
+}
+
+func golfKindLabel(kind string) string {
+	switch kind {
+	case "ptr":
+		return "pointer"
+	case "slice":
+		return "slice"
+	}
+	return kind
+}
+
+// isGolfWrapperFor reports whether f is the golf package's copy or
+// transfer primitive for the given golfBoundaryKind.
+func isGolfWrapperFor(f *types2.Func, kind string) bool {
+	pkg := f.Pkg()
+	if pkg == nil || pkg.Path() != "golf" {
+		return false
+	}
+	copyName, transferName := golfWrapperNames(kind)
+	return f.Name() == copyName || f.Name() == transferName
+}
+
+// isAnyGolfWrapper reports whether f is any of golf's copy/transfer
+// ownership primitives (DESIGN.md §3.3), regardless of kind.
+func isAnyGolfWrapper(f *types2.Func) bool {
 	pkg := f.Pkg()
 	if pkg == nil || pkg.Path() != "golf" {
 		return false
 	}
 	switch f.Name() {
-	case "Copy", "Transfer":
+	case "Copy", "Transfer", "CopySlice", "TransferSlice":
 		return true
 	}
 	return false
 }
 
-// calleeSinglePointerResult reports whether f has exactly one result
-// and that result's type is a pointer. Multi-result functions are not
-// checked for cross-mode return crossing in v1; see DESIGN.md §3.3.
-func calleeSinglePointerResult(f *types2.Func) bool {
-	sig, ok := f.Type().(*types2.Signature)
-	if !ok {
-		return false
-	}
-	results := sig.Results()
-	if results.Len() != 1 {
-		return false
-	}
-	_, isPtr := results.At(0).Type().Underlying().(*types2.Pointer)
-	return isPtr
-}
-
 // checkGolfBoundaryArg enforces GOLF's copy-at-boundary rule
-// (DESIGN.md §3.3): a pointer-typed argument passed across a call
-// that crosses between a gc-mode and a manual-mode file must be the
-// direct result of golf.Copy or golf.Transfer, making the ownership
-// decision explicit at the call site rather than implicit.
+// (DESIGN.md §3.3): a pointer- or slice-typed argument passed across
+// a call that crosses between a gc-mode and a manual-mode file must
+// be the direct result of golf's copy or transfer primitive for that
+// kind, making the ownership decision explicit at the call site
+// rather than implicit.
 func checkGolfBoundaryArg(pw *pkgWriter, arg syntax.Expr) {
 	tv, ok := pw.maybeTypeAndValue(arg)
-	if !ok || tv.Type == nil {
+	if !ok {
 		return
 	}
-	if _, isPtr := tv.Type.Underlying().(*types2.Pointer); !isPtr {
+	kind := golfBoundaryKind(tv.Type)
+	if kind == "" {
 		return
 	}
 
 	call, ok := syntax.Unparen(arg).(*syntax.CallExpr)
 	if ok {
-		if f, ok := calleeFunc(pw.info, call.Fun); ok && isGolfOwnershipFunc(f) {
+		if f, ok := calleeFunc(pw.info, call.Fun); ok && isGolfWrapperFor(f, kind) {
 			return
 		}
 	}
 
-	pw.errorf(arg, "implicit cross-mode pointer argument not allowed; wrap in golf.Copy(...) or golf.Transfer(...) to make ownership explicit; see DESIGN.md §3.3")
+	copyName, transferName := golfWrapperNames(kind)
+	pw.errorf(arg, "implicit cross-mode %s argument not allowed; wrap in golf.%s(...) or golf.%s(...) to make ownership explicit; see DESIGN.md §3.3",
+		golfKindLabel(kind), copyName, transferName)
+}
+
+// checkGolfBoundaryResult enforces GOLF's copy-at-boundary rule on a
+// cross-mode call's return value(s) (DESIGN.md §3.3). A single
+// pointer- or slice-typed result must be wrapped the same way an
+// argument would be (checked via pw.golfReturnExempt, set when n
+// appears as the sole argument to a golf wrapper call). A function
+// with more than one result, where any result is pointer- or
+// slice-typed, is rejected outright: golf's wrappers take one value,
+// so there's no syntax to make a multi-result crossing explicit yet;
+// see DESIGN.md §3.3's named gap.
+func checkGolfBoundaryResult(pw *pkgWriter, n *syntax.CallExpr, callee *types2.Func) {
+	sig, ok := callee.Type().(*types2.Signature)
+	if !ok {
+		return
+	}
+	results := sig.Results()
+
+	if results.Len() > 1 {
+		for i := 0; i < results.Len(); i++ {
+			if golfBoundaryKind(results.At(i).Type()) != "" {
+				pw.errorf(n, "cross-mode call to %s with multiple return values including a pointer or slice is not supported; golf.Copy/Transfer only wrap a single value; see DESIGN.md §3.3", callee.Name())
+				return
+			}
+		}
+		return
+	}
+
+	if results.Len() != 1 || pw.golfReturnExempt[n] {
+		return
+	}
+	kind := golfBoundaryKind(results.At(0).Type())
+	if kind == "" {
+		return
+	}
+	copyName, transferName := golfWrapperNames(kind)
+	pw.errorf(n, "implicit cross-mode %s return value not allowed; wrap the call in golf.%s(...) or golf.%s(...) to make ownership explicit; see DESIGN.md §3.3",
+		golfKindLabel(kind), copyName, transferName)
 }
 
 // scopeContains reports whether ancestor is s itself or one of s's

@@ -37,3 +37,25 @@ func Copy[T any](p *T) *T {
 func Transfer[T any](p *T) *T {
 	return p
 }
+
+// CopySlice and TransferSlice are Copy and Transfer's equivalents for
+// slice-typed values, which hold an implicit reference to a backing
+// array and so carry the same cross-mode hazard as a bare pointer.
+
+// CopySlice returns a new slice holding a shallow copy of s's
+// elements, backed by a new array s does not share.
+func CopySlice[T any](s []T) []T {
+	if s == nil {
+		return nil
+	}
+	c := make([]T, len(s))
+	copy(c, s)
+	return c
+}
+
+// TransferSlice returns s unchanged. It exists only to mark, at the
+// call site, that ownership of s's backing array is being handed off
+// rather than copied.
+func TransferSlice[T any](s []T) []T {
+	return s
+}
