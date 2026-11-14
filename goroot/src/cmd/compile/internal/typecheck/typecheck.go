@@ -292,6 +292,26 @@ func typecheck1(curfunc *ir.Func, n ir.Node, top int) ir.Node {
 		n.SetType(t)
 		return n
 
+	// GOLF: nil-coalescing operator (see DESIGN.md §5.2). types2
+	// (cmd/compile/internal/types2's golfCoalesce) already validated
+	// this and chose the result type when building the unified IR;
+	// this re-derives the same type from n.X, same defense-in-depth
+	// every other operator here gets, rather than trusting it blindly.
+	case ir.OGOLFCOALESCE:
+		n := n.(*ir.LogicalExpr)
+		n.X, n.Y = Expr(curfunc, n.X), Expr(curfunc, n.Y)
+		if n.X.Type() == nil || n.Y.Type() == nil {
+			n.SetType(nil)
+			return n
+		}
+		if !golfNilable(n.X.Type()) {
+			base.Errorf("invalid operation: %v (operator ?? not defined: left operand's type %v is never nil)", n, n.X.Type())
+			n.SetType(nil)
+			return n
+		}
+		n.SetType(n.X.Type())
+		return n
+
 	// shift operators
 	case ir.OLSH, ir.ORSH:
 		n := n.(*ir.BinaryExpr)

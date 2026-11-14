@@ -378,7 +378,7 @@ func mayCall(n ir.Node) bool {
 			}
 			return true
 
-		case ir.OANDAND, ir.OOROR:
+		case ir.OANDAND, ir.OOROR, ir.OGOLFCOALESCE:
 			n := n.(*ir.LogicalExpr)
 			// The RHS expression may have init statements that
 			// should only execute conditionally, and so cannot be

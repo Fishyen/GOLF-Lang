@@ -808,6 +808,44 @@ func init() {
 	}
 }
 
+// golfCoalesce type-checks GOLF's "??" nil-coalescing operator:
+// "x ?? y" evaluates x; if x is nil, y is evaluated and used instead.
+// See DESIGN.md §5.2.
+//
+// Deliberately not routed through check.binary, which requires the
+// two operands to have identical types and only accepts a fixed set
+// of op predicates (allNumeric, allBoolean, ...) -- neither matches
+// this operator's actual rule: x's type only needs to be nilable
+// (hasNil), and y only needs to be assignable to it, not identical.
+func (check *Checker) golfCoalesce(x *operand, e, lhs, rhs syntax.Expr) {
+	check.expr(nil, x, lhs)
+	if !x.isValid() {
+		return
+	}
+	if !hasNil(x.typ()) {
+		check.errorf(x, UndefinedOp, invalidOp+"%s (operator ?? not defined: left operand's type %s is never nil)", e, x.typ())
+		x.invalidate()
+		return
+	}
+	target := x.typ()
+
+	var y operand
+	check.expr(newTarget(target, "?? operand"), &y, rhs)
+	if !y.isValid() {
+		x.invalidate()
+		return
+	}
+	check.assignment(&y, target, "?? operand")
+	if !y.isValid() {
+		x.invalidate()
+		return
+	}
+
+	x.mode_ = value
+	x.typ_ = target
+	x.expr = e
+}
+
 // isUntypedCompLit returns whether e is directly an untyped composite literal,
 // without traversing parenthesis (to reflect type inference mechanics).
 func isUntypedCompLit(e syntax.Expr) bool {
@@ -1250,7 +1288,11 @@ func (check *Checker) exprInternal(T *target, x *operand, e syntax.Expr) exprKin
 		}
 
 		// binary expression
-		check.binary(x, e, e.X, e.Y, e.Op)
+		if e.Op == syntax.NilCoalesce {
+			check.golfCoalesce(x, e, e.X, e.Y)
+		} else {
+			check.binary(x, e, e.X, e.Y, e.Op)
+		}
 		if !x.isValid() {
 			goto Error
 		}

@@ -2459,7 +2459,7 @@ func (r *reader) expr() (res ir.Node) {
 		y := r.expr()
 
 		switch op {
-		case ir.OANDAND, ir.OOROR:
+		case ir.OANDAND, ir.OOROR, ir.OGOLFCOALESCE:
 			return typecheck.Expr(r.curfn, ir.NewLogicalExpr(pos, op, x, y))
 		case ir.OLSH, ir.ORSH:
 			// Untyped rhs of non-constant shift, e.g. x << 1.0.

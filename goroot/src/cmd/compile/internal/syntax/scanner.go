@@ -321,6 +321,18 @@ redo:
 		s.op, s.prec = Tilde, 0
 		s.tok = _Operator
 
+	case '?':
+		// GOLF's nil-coalescing operator (see DESIGN.md §5.2); stock Go
+		// has no use for a lone '?' either, so this is unambiguous.
+		if s.ch == '?' {
+			s.nextch()
+			s.op, s.prec = NilCoalesce, precNilCoalesce
+			s.tok = _Operator
+			break
+		}
+		s.errorAtf(0, "invalid character %#U", ch)
+		goto redo
+
 	default:
 		if ch >= utf8.RuneSelf {
 			switch {

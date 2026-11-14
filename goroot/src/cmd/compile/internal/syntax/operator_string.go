@@ -38,6 +38,12 @@ const _Operator_name = ":!<-~||&&==!=<<=>>=+-|^*/%&&^<<>>"
 var _Operator_index = [...]uint8{0, 1, 2, 4, 5, 7, 9, 11, 13, 14, 16, 17, 19, 20, 21, 22, 23, 24, 25, 26, 27, 29, 31, 33}
 
 func (i Operator) String() string {
+	// NilCoalesce is a GOLF addition (see DESIGN.md §5.2), hand-added
+	// here rather than through stringer since it isn't part of the
+	// generated table above.
+	if i == NilCoalesce {
+		return "??"
+	}
 	idx := int(i) - 1
 	if i < 1 || idx >= len(_Operator_index)-1 {
 		return "Operator(" + strconv.FormatInt(int64(i), 10) + ")"

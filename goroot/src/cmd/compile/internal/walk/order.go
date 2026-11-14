@@ -1378,6 +1378,47 @@ func (o *orderState) expr1(walkstate *walkState, n, lhs ir.Node) ir.Node {
 		o.out = append(o.out, nif)
 		return r
 
+	case ir.OGOLFCOALESCE:
+		// ... = LHS ?? RHS
+		//
+		// r := LHS
+		// if r == nil {
+		//     r = RHS
+		// }
+		// ... = r
+		//
+		// Same shape as OANDAND/OOROR above, except the condition is a
+		// nil check rather than r's own (bool) value, since r's type
+		// here is whatever nilable type LHS has, not bool. See
+		// DESIGN.md §5.2.
+		n := n.(*ir.LogicalExpr)
+		r := o.newTemp(walkstate, n.Type(), false)
+
+		// Evaluate left-hand side.
+		lhs := o.expr(walkstate, n.X, nil)
+		o.out = append(o.out, typecheck.Stmt(o.walkstate.curfunc, ir.NewAssignStmt(base.Pos, r, lhs)))
+
+		// Evaluate right-hand side, save generated code.
+		saveout := o.out
+		o.out = nil
+		t := o.markTemp()
+		o.edge()
+		rhs := o.expr(walkstate, n.Y, nil)
+		o.out = append(o.out, typecheck.Stmt(o.walkstate.curfunc, ir.NewAssignStmt(base.Pos, r, rhs)))
+		o.popTemp(t)
+		gen := o.out
+		o.out = saveout
+
+		// If left-hand side is non-nil, skip the right-hand side.
+		// Comparisons type-check to untyped bool (per spec); DefaultLit
+		// finalizes it to concrete bool, same as tcIf does for an
+		// ordinary "if" condition -- needed here since this cond is
+		// handed straight to ir.NewIfStmt without going through tcIf.
+		cond := typecheck.DefaultLit(typecheck.Expr(o.walkstate.curfunc, ir.NewBinaryExpr(base.Pos, ir.OEQ, r, ir.NewNilExpr(base.Pos, r.Type()))), nil)
+		nif := ir.NewIfStmt(base.Pos, cond, gen, nil)
+		o.out = append(o.out, nif)
+		return r
+
 	case ir.OCALLMETH:
 		base.FatalfAt(n.Pos(), "OCALLMETH missed by typecheck")
 		panic("unreachable")

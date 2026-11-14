@@ -455,6 +455,7 @@ func readsMemory(n ir.Node) bool {
 		ir.ONIL,
 		ir.OOR,
 		ir.OOROR,
+		ir.OGOLFCOALESCE,
 		ir.OPAREN,
 		ir.OPLUS,
 		ir.ORSH,

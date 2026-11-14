@@ -430,7 +430,7 @@ func (n *LogicalExpr) SetOp(op Op) {
 	switch op {
 	default:
 		panic(n.no("SetOp " + op.String()))
-	case OANDAND, OOROR:
+	case OANDAND, OOROR, OGOLFCOALESCE:
 		n.op = op
 	}
 }
@@ -1380,6 +1380,7 @@ func IsSideEffect(n Node) bool {
 		OADDSTR,
 		OADDR,
 		OANDAND,
+		OGOLFCOALESCE,
 		OBYTES2STR,
 		ORUNES2STR,
 		OSTR2BYTES,

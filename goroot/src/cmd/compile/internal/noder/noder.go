@@ -137,6 +137,9 @@ var binOps = [...]ir.Op{
 	syntax.OrOr:   ir.OOROR,
 	syntax.AndAnd: ir.OANDAND,
 
+	// GOLF opcodes (see DESIGN.md §5.2)
+	syntax.NilCoalesce: ir.OGOLFCOALESCE,
+
 	syntax.Eql: ir.OEQ,
 	syntax.Neq: ir.ONE,
 	syntax.Lss: ir.OLT,

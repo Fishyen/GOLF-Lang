@@ -28,6 +28,7 @@ var OpNames = []string{
 	OADD:              "+",
 	OADDSTR:           "+",
 	OANDAND:           "&&",
+	OGOLFCOALESCE:     "??",
 	OANDNOT:           "&^",
 	OAND:              "&",
 	OAPPEND:           "append",
@@ -262,6 +263,7 @@ var OpPrec = []int{
 	OSEND:             3,
 	OANDAND:           2,
 	OOROR:             1,
+	OGOLFCOALESCE:     0,
 
 	// Statements handled by stmtfmt
 	OAS:         -1,
@@ -829,7 +831,8 @@ func exprFmt(n Node, s fmt.State, prec int) {
 		exprFmt(n.Y, s, nprec+1)
 
 	case OANDAND,
-		OOROR:
+		OOROR,
+		OGOLFCOALESCE:
 		n := n.(*LogicalExpr)
 		exprFmt(n.X, s, nprec)
 		fmt.Fprintf(s, " %v ", n.Op())

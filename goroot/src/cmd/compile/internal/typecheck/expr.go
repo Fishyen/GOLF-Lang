@@ -41,6 +41,13 @@ func tcShift(n, l, r ir.Node) (ir.Node, ir.Node, *types.Type) {
 	return l, r, t
 }
 
+// golfNilable reports whether t is one of the kinds a value can
+// actually be nil for -- GOLF's "??" left-operand requirement (see
+// DESIGN.md §5.2); mirrors types2's hasNil predicate at the ir level.
+func golfNilable(t *types.Type) bool {
+	return t.IsPtr() || t.IsMap() || t.IsChan() || t.IsSlice() || t.IsInterface() || t.Kind() == types.TFUNC
+}
+
 // tcArith typechecks operands of a binary arithmetic expression.
 // The result of tcArith MUST be assigned back to original operands,
 // t is the type of the expression, and should be set by the caller. e.g:

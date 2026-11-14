@@ -184,6 +184,10 @@ func (w *walkState) walkExpr1(n ir.Node, init *ir.Nodes) ir.Node {
 		n := n.(*ir.LogicalExpr)
 		return w.walkLogical(n, init)
 
+	case ir.OGOLFCOALESCE:
+		n := n.(*ir.LogicalExpr)
+		return w.walkGolfCoalesce(n, init)
+
 	case ir.OPRINT, ir.OPRINTLN:
 		return w.walkPrint(n.(*ir.CallExpr), init)
 
@@ -945,6 +949,35 @@ func (w *walkState) walkLogical(n *ir.LogicalExpr, init *ir.Nodes) ir.Node {
 	n.Y = w.walkExpr(n.Y, &ll)
 	n.Y = ir.InitExpr(ll, n.Y)
 	return n
+}
+
+// walkGolfCoalesce walks an OGOLFCOALESCE ("X ?? Y") node. See
+// DESIGN.md §5.2. Unlike walkLogical (OANDAND/OOROR), which leaves its
+// node in place for ssagen to branch on directly, this lowers all the
+// way down to a plain temp and an ordinary if, built from
+//
+//	tmp := X
+//	if tmp == nil {
+//	    tmp = Y
+//	}
+//
+// with tmp as the resulting expression. That's deliberate: "tmp ==
+// nil" then goes through exactly the same comparison machinery
+// (appendWalkStmt: typecheck.Stmt, then walkStmt) an ordinary,
+// hand-written nil check would, including interface/slice nil
+// comparisons' own decomposition elsewhere in this package -- so
+// nothing downstream of walk (ssagen included) ever needs to know
+// "??" exists at all.
+func (w *walkState) walkGolfCoalesce(n *ir.LogicalExpr, init *ir.Nodes) ir.Node {
+	tmp := typecheck.TempAt(base.Pos, w.curfunc, n.Type())
+	w.appendWalkStmt(init, ir.NewAssignStmt(base.Pos, tmp, n.X))
+
+	nif := ir.NewIfStmt(base.Pos, nil, nil, nil)
+	nif.Cond = ir.NewBinaryExpr(base.Pos, ir.OEQ, tmp, ir.NewNilExpr(base.Pos, tmp.Type()))
+	nif.Body.Append(ir.NewAssignStmt(base.Pos, tmp, n.Y))
+	w.appendWalkStmt(init, nif)
+
+	return tmp
 }
 
 // walkSend walks an OSEND node.

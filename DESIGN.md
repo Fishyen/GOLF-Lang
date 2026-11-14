@@ -541,7 +541,9 @@ this document.
 
 1. **Error-propagation sugar** (`try`/`catch`/`success`) -- **done**, see
    below.
-2. `??` nil-coalescing for pointers/interfaces.
+2. **done**, see §5.2 -- `??` nil-coalescing, generalized to every
+   nilable kind (pointer, slice, map, chan, func, interface), not just
+   pointers/interfaces.
 3. Compile-time `implements` assertion sugar, replacing the
    `var _ I = (*T)(nil)` idiom.
 4. Opt-in exhaustive-switch checking over a closed set of consts.
@@ -694,3 +696,133 @@ try {
   used" once there was truly no checkpoint to reach it from -- fixed by
   detecting that case up front and falling back to a plain inlined block
   with no synthesized control flow at all.
+
+### 5.2 Nil-coalescing: `??`
+
+**Status: implemented.** `x ?? y` evaluates `x`; if `x` is nil, `y` is
+evaluated and used instead, exactly as `x` would be if it weren't nil.
+Unlike `try`/`catch`/`success` (§5.1), this isn't a contextual keyword or
+a pure syntax-level trick -- `?` isn't used anywhere else in Go's
+grammar at all, so `??` is a completely new, unambiguous token/operator,
+added at the lexer level (`cmd/compile/internal/syntax/scanner.go`)
+exactly like `&&`/`||` already are, with its own precedence
+(`precNilCoalesce`), looser than `||`'s (so `a || b ?? c` parses as
+`(a || b) ?? c`).
+
+```go
+cache := lookup(key) ?? computeDefault(key)
+name := user.Nickname ?? user.FullName ?? "anonymous"
+```
+
+- **Typing rule:** `x`'s type must be one Go values can actually be nil
+  for -- pointer, slice, map, channel, func, or interface (including
+  `error`) -- checked via a `hasNil`-style predicate, not a fixed set of
+  operand types the way `&&`/`||` require exactly `bool`. `y` only needs
+  to be *assignable* to `x`'s type (implicit conversions apply exactly as
+  they would for an ordinary assignment), not identical to it -- so
+  `error ?? error` works, and so does a concrete pointer type on one side
+  coalescing into an interface-typed default, etc. The result's type is
+  `x`'s type. A non-nilable `x` (e.g. `int ?? int`) is a compile error
+  ("operator ?? not defined: left operand's type int is never nil").
+  Chaining works for free (`a ?? b ?? c` is just `(a ?? b) ?? c`, since
+  `??`'s own result type is always `x`'s type, itself nilable).
+- **Short-circuiting:** `y` is only evaluated if `x` turns out to be nil
+  -- verified with a side-effecting `y` (a function call with a counter)
+  that's never invoked when `x` is non-nil, and invoked exactly once when
+  it is.
+- **Implementation, spanning every layer a brand-new binary operator
+  touches** (considerably more than §5.1's `try`/`catch`/`success`, which
+  stayed entirely inside the parser by design):
+  - **Lexer/token** (`syntax/scanner.go`, `syntax/tokens.go`): a new
+    `Operator` constant `NilCoalesce`, deliberately given an explicit
+    value *after* the existing stock-Go operator block (rather than
+    inserted into it) so the hand-generated `stringer` indices for every
+    *other* operator don't need touching; a new `precNilCoalesce`,
+    inserted before `precOrOr` in that iota block instead (precedence
+    values aren't serialized anywhere, so renumbering them is safe). Once
+    lexed as an ordinary `_Operator` token, the existing, fully generic
+    `binaryExpr` parser loop (unchanged) picks it up automatically --
+    `??` needed zero parser.go changes.
+  - **Type-checking** (`types2/expr.go`): a dedicated `golfCoalesce`
+    function, *not* routed through `check.binary` (the shared path for
+    every stock binary operator), since that function hard-requires
+    identical operand types and a fixed per-operator predicate table
+    (`allNumeric`, `allBoolean`, ...) -- neither matches this operator's
+    actual rule. Intercepted at the one call site in the main expression
+    switch (`*syntax.Operation` with `Y != nil`) that would otherwise
+    call `check.binary`.
+  - **Unified IR plumbing**: a new `ir.Op` (`OGOLFCOALESCE`, inserted into
+    the main iota block just before the `OEND` sentinel so every
+    `[ir.OEND]`-sized lookup table -- `okfor` included -- grows to
+    accommodate it automatically) represented via the *existing*
+    `ir.LogicalExpr` node type (same `X`, `Y` shape `&&`/`||` already
+    use); `noder.binOps` gains the `syntax.NilCoalesce` →
+    `ir.OGOLFCOALESCE` mapping that both the writer (encoding) and
+    reader (decoding) sides of the export-data pipeline consult
+    generically, so no additional pkgbits format changes were needed
+    beyond that one table entry.
+  - **ir-level re-typecheck** (`typecheck/typecheck.go`): unified IR's
+    reader rebuilds expressions by calling the *existing* legacy
+    typecheck dispatch on every constructed node (true for ordinary
+    `&&`/`||` too, not something unique to this feature), so
+    `OGOLFCOALESCE` needed its own case there as well -- re-deriving the
+    same nilable-operand validation and result type `types2` already
+    settled on, as defense in depth, the same way every other operator's
+    case in that dispatch does.
+  - **Escape analysis** (`escape/expr.go`): has its own exhaustive
+    per-op switch over every expression kind (panics on anything
+    missing) -- `&&`/`||` discard both operands there (a bool result
+    can't itself carry a pointer), but `??`'s result **is** whichever of
+    `X` or `Y` was picked, so both must flow into the same destination
+    hole instead of being discarded. Conservative but sound: escape
+    analysis doesn't know *which* one wins until runtime, so it has to
+    assume either could.
+  - **Lowering, chosen to touch the backend as little as possible:**
+    rather than teaching `ssagen` a new branch-and-phi shape (what
+    `&&`/`||` get, directly, as their primary lowering path), `??` is
+    fully eliminated earlier, during the **order** and **walk** passes,
+    into a plain temp plus an ordinary `if`:
+    ```go
+    tmp := X
+    if tmp == nil {
+        tmp = Y
+    }
+    ```
+    with `tmp` as the resulting expression -- so the nil check goes
+    through the *exact* same comparison machinery an ordinary,
+    hand-written `tmp == nil` would, including slice/interface nil
+    comparisons' own decomposition elsewhere in `walk/compare.go`, rather
+    than this feature having to re-implement nil-comparison codegen
+    correctly for every nilable kind from scratch. Two call sites, since
+    `??` can reach walk via either pipeline stage depending on how deeply
+    it's nested in a larger expression (`order/order.go`'s dedicated case
+    for contexts needing evaluation-order normalization, e.g. nested
+    inside a function call's arguments; `walk/expr.go`'s `walkGolfCoalesce`
+    for everything else) -- both build the same shape, so `ssagen` never
+    sees a raw `??` node at all, and needed no changes whatsoever.
+  - **Bookkeeping-only additions**, needed for debug printing and
+    escape/walk's own generic "does this expression already have side
+    effects, does it need reordering" helper switches, mirroring exactly
+    how `&&`/`||` are listed in each: `ir/fmt.go` (print as `"??"`, with
+    its own (looser) precedence for parenthesization in debug dumps),
+    `ir/expr.go` (`LogicalExpr.SetOp`'s allowed-op list; the
+    no-side-effect classification list), `walk/walk.go` (the "right-hand
+    side's init can't be hoisted unconditionally" check), `walk/assign.go`
+    (the "does this expression read memory" classification).
+- **Bug found during development:** the `order.go` path's first version
+  built the `tmp == nil` condition with a bare `typecheck.Expr` call and
+  handed it straight to `ir.NewIfStmt`, which crashed later, during
+  `walk`, with "expression has untyped type" -- comparisons type-check to
+  *untyped* bool per the Go spec (not concrete `bool`) regardless of
+  whether either operand is a constant; normally, whatever consumes a
+  comparison as a condition (`tcIf`, for an ordinary hand-written `if`)
+  finalizes it via `DefaultLit` immediately afterward, which this
+  hand-built condition skipped entirely since it was never passed through
+  `tcIf`. Fixed by calling `typecheck.DefaultLit` explicitly on the
+  constructed condition, same as `tcIf` itself does.
+- **Verified** with a full three-stage `./make.bash` bootstrap, `go test
+  ./...` across `cmd/compile` (`syntax` and `types2` included), `go
+  build`/`vet std cmd`, and a hand-written matrix covering: pointer, map,
+  interface (`error`), and slice operands; chained `??`; short-circuit
+  evaluation (a side-effecting fallback called exactly once, only when
+  needed); and rejection of a non-nilable left operand.

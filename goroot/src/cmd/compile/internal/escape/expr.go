@@ -59,6 +59,14 @@ func (e *escape) exprSkipInit(k hole, n ir.Node) {
 		n := n.(*ir.LogicalExpr)
 		e.discard(n.X)
 		e.discard(n.Y)
+	case ir.OGOLFCOALESCE:
+		// Unlike OANDAND/OOROR, whichever of X or Y is actually
+		// picked at runtime becomes this expression's own value, so
+		// both must flow into k rather than being discarded. See
+		// DESIGN.md §5.2.
+		n := n.(*ir.LogicalExpr)
+		e.expr(k, n.X)
+		e.expr(k, n.Y)
 	case ir.OADDR:
 		n := n.(*ir.AddrExpr)
 		e.expr(k.addr(n, "address-of"), n.X) // "address-of"

@@ -308,6 +308,9 @@ const (
 	OGETG        // runtime.getg() (read g pointer)
 	OGETCALLERSP // internal/runtime/sys.GetCallerSP() (stack pointer in caller frame)
 
+	// GOLF opcodes (see DESIGN.md §5.2)
+	OGOLFCOALESCE // X ?? Y
+
 	OEND
 )
 

@@ -148,9 +148,18 @@ const (
 	Shr    // >>
 )
 
+// NilCoalesce is GOLF's "??" nil-coalescing operator (see DESIGN.md
+// §5.2). Deliberately given its own explicit value, appended after
+// the stock Go operator block above, rather than inserted into the
+// iota sequence: that would shift every later constant's numeric
+// value and require regenerating operator_string.go's indices for
+// operators that have nothing to do with this feature.
+const NilCoalesce Operator = 100
+
 // Operator precedences
 const (
 	_ = iota
+	precNilCoalesce
 	precOrOr
 	precAndAnd
 	precCmp
